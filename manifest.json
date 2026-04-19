@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Wonder of U",
+  "version": "1.2",
+  "description": "Record tab audio, save locally, and transcribe with a local Whisper native host",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "activeTab",
+    "commands",
+    "downloads",
+    "nativeMessaging",
+    "offscreen",
+    "scripting",
+    "storage",
+    "tabCapture",
+    "tabs"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "128": "icon.png"
+    },
+    "default_popup": "popup.html",
+    "default_title": "Wonder of U"
+  },
+  "icons": {
+    "128": "icon.png"
+  },
+  "commands": {
+    "start-recording": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+1"
+      },
+      "description": "Start recording tab audio"
+    },
+    "stop-recording": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+2"
+      },
+      "description": "Stop recording"
+    }
+  }
+}

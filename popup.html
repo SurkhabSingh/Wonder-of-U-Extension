@@ -1,0 +1,471 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Tab Audio Recorder</title>
+    <style>
+      :root {
+        --bg: #f7efe5;
+        --panel: rgba(255, 255, 255, 0.74);
+        --panel-border: rgba(102, 71, 58, 0.12);
+        --text: #2c1e18;
+        --muted: #6f5449;
+        --accent: #bb4d2f;
+        --accent-strong: #8f361d;
+        --success: #22694f;
+        --warning: #8c5608;
+        --danger: #8f261f;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        width: 380px;
+        margin: 0;
+        padding: 16px;
+        font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(
+            circle at top right,
+            rgba(255, 215, 170, 0.95),
+            transparent 38%
+          ),
+          linear-gradient(160deg, #fff8f0 0%, var(--bg) 55%, #f0dfcf 100%);
+      }
+
+      .shell {
+        border: 1px solid var(--panel-border);
+        border-radius: 20px;
+        padding: 16px;
+        background: var(--panel);
+        backdrop-filter: blur(10px);
+        box-shadow: 0 18px 40px rgba(82, 49, 36, 0.14);
+      }
+
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+      }
+
+      .title {
+        margin: 0;
+        font-size: 18px;
+        letter-spacing: 0.02em;
+      }
+
+      .subtitle {
+        margin: 4px 0 0;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 74px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(44, 30, 24, 0.08);
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .pill.recording {
+        color: #fff7f5;
+        background: linear-gradient(
+          135deg,
+          var(--accent) 0%,
+          var(--accent-strong) 100%
+        );
+      }
+
+      .pill.processing {
+        color: #fff4db;
+        background: linear-gradient(135deg, #b87009 0%, var(--warning) 100%);
+      }
+
+      .timer-card {
+        margin-top: 16px;
+        padding: 14px 16px;
+        border-radius: 18px;
+        background: linear-gradient(
+          145deg,
+          rgba(44, 30, 24, 0.95),
+          rgba(69, 46, 37, 0.88)
+        );
+        color: #fffaf4;
+      }
+
+      .timer-label {
+        font-size: 11px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: rgba(255, 244, 231, 0.72);
+      }
+
+      .timer-value {
+        margin-top: 8px;
+        font-size: 34px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+      }
+
+      .controls {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        margin-top: 14px;
+      }
+
+      button {
+        border: none;
+        border-radius: 14px;
+        padding: 11px 12px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+        transition:
+          transform 120ms ease,
+          box-shadow 120ms ease,
+          opacity 120ms ease;
+      }
+
+      button:hover:not(:disabled) {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      #start {
+        background: linear-gradient(135deg, var(--accent) 0%, #d7653d 100%);
+        color: #fff8f2;
+        box-shadow: 0 10px 22px rgba(187, 77, 47, 0.26);
+      }
+
+      #stop {
+        background: rgba(44, 30, 24, 0.08);
+        color: var(--text);
+      }
+
+      .section {
+        margin-top: 14px;
+        padding: 12px 13px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.62);
+        border: 1px solid rgba(102, 71, 58, 0.1);
+      }
+
+      .section-title {
+        margin: 0 0 10px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .field + .field {
+        margin-top: 12px;
+      }
+
+      label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      select,
+      input {
+        width: 100%;
+        border: 1px solid rgba(102, 71, 58, 0.16);
+        border-radius: 12px;
+        padding: 10px 12px;
+        font: inherit;
+        color: var(--text);
+        background: rgba(255, 252, 248, 0.96);
+      }
+
+      .path-input-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .browse-button {
+        min-width: 78px;
+        padding: 10px 12px;
+        border: 1px solid rgba(102, 71, 58, 0.16);
+        background: rgba(44, 30, 24, 0.08);
+        color: var(--text);
+      }
+
+      .prefix-field {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .prefix {
+        padding: 10px 0;
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--muted);
+      }
+
+      .toggle {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13px;
+        font-weight: 700;
+        color: var(--text);
+      }
+
+      .toggle input {
+        width: auto;
+        margin: 0;
+        accent-color: var(--accent);
+      }
+
+      .hint,
+      .hotkeys {
+        margin: 8px 0 0;
+        font-size: 11px;
+        line-height: 1.45;
+        color: var(--muted);
+      }
+
+      code {
+        padding: 1px 4px;
+        border-radius: 6px;
+        background: rgba(44, 30, 24, 0.08);
+        font-family: "Consolas", "Courier New", monospace;
+        color: var(--text);
+      }
+
+      .status {
+        margin: 0;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .status.processing {
+        color: var(--warning);
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      .status.recording {
+        color: var(--success);
+      }
+
+      .muted-block {
+        opacity: 0.6;
+      }
+
+      .queue-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .queue-card {
+        padding: 12px 13px;
+        border-radius: 14px;
+        background: rgba(44, 30, 24, 0.05);
+      }
+
+      .queue-label {
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .queue-count {
+        margin-top: 6px;
+        font-size: 26px;
+        font-weight: 700;
+        color: var(--text);
+      }
+
+      #pushQueue {
+        min-width: 122px;
+        background: rgba(44, 30, 24, 0.08);
+        color: var(--text);
+      }
+
+      .hint.error {
+        color: var(--danger);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <div class="header">
+        <div>
+          <h1 class="title">Wonder of U</h1>
+          <p class="subtitle">
+            Capture the current tab's audio, save it, and optionally transcribe
+            it locally.
+          </p>
+        </div>
+        <div id="statePill" class="pill">Idle</div>
+      </div>
+
+      <section class="timer-card">
+        <div class="timer-label">Elapsed Time</div>
+        <div id="timer" class="timer-value">00:00</div>
+      </section>
+
+      <div class="controls">
+        <button id="start" type="button">Start</button>
+        <button id="stop" type="button">Stop</button>
+      </div>
+
+      <section class="section">
+        <p class="section-title">Recording</p>
+
+        <div class="field">
+          <label for="format">Audio format</label>
+          <select id="format">
+            <option value="webm">WebM</option>
+            <option value="mp3">MP3</option>
+            <option value="wav">WAV (16-bit)</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="downloadFolder">Download folder</label>
+          <div class="prefix-field">
+            <span class="prefix">Downloads/</span>
+            <input
+              id="downloadFolder"
+              type="text"
+              placeholder="TabRecordings"
+              autocomplete="off"
+            />
+          </div>
+          <p id="pathHint" class="hint">Saved inside your Downloads folder.</p>
+        </div>
+      </section>
+
+      <section class="section">
+        <p class="section-title">Transcription</p>
+
+        <div class="field">
+          <label class="toggle">
+            <input id="transcriptionEnabled" type="checkbox" />
+            <span>Transcribe after save</span>
+          </label>
+        </div>
+
+        <div id="transcriptionFields">
+          <div class="field">
+            <label for="whisperCliPath">`whisper-cli` path</label>
+            <div class="path-input-row">
+              <input
+                id="whisperCliPath"
+                type="text"
+                placeholder="C:\\path\\to\\whisper-cli.exe"
+                autocomplete="off"
+              />
+              <button id="browseWhisperCliPath" class="browse-button" type="button">
+                Browse
+              </button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="whisperModelPath">Whisper model path</label>
+            <div class="path-input-row">
+              <input
+                id="whisperModelPath"
+                type="text"
+                placeholder="C:\\path\\to\\ggml-large-v3.bin"
+                autocomplete="off"
+              />
+              <button id="browseWhisperModelPath" class="browse-button" type="button">
+                Browse
+              </button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="whisperLanguage">Language</label>
+            <input
+              id="whisperLanguage"
+              type="text"
+              placeholder="ja"
+              autocomplete="off"
+            />
+          </div>
+        </div>
+
+        <p class="hint">
+          Native Messaging wakes the local host only when a recording needs
+          transcription. Install it once with
+          <code>install-native-host.ps1</code>; you do not need to keep a bridge
+          window open.
+        </p>
+        <p class="hint">
+          Successful jobs also try to create an Anki card in
+          <code>Audio Immersion</code> with the audio on the front and the
+          transcript on the back. If Anki is closed, the transcript is still
+          saved and you will see <code>Anki offline</code>.
+        </p>
+        <p class="hint">
+          A strong starting point is <code>ggml-large-v3.bin</code> for better
+          accuracy, but it is noticeably heavier and slower than smaller models
+          on CPU.
+        </p>
+      </section>
+
+      <section class="section">
+        <p class="section-title">Anki Queue</p>
+        <div class="queue-row">
+          <div class="queue-card">
+            <div class="queue-label">Queued Cards</div>
+            <div id="queueCount" class="queue-count">0</div>
+          </div>
+          <button id="pushQueue" type="button">Push to Anki</button>
+        </div>
+        <p id="queueStatus" class="hint">Queue empty.</p>
+      </section>
+
+      <section class="section">
+        <p class="section-title">Status</p>
+        <p id="status" class="status">Idle</p>
+        <p class="hotkeys">
+          Hotkeys: <code>Ctrl+Shift+1</code> starts,
+          <code>Ctrl+Shift+2</code> stops.
+        </p>
+      </section>
+    </main>
+
+    <script src="utils.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

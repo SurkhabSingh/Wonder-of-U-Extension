@@ -1,0 +1,3 @@
+native-host-manifest.json
+*.md
+!README.md
