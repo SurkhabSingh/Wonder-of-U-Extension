@@ -3,10 +3,12 @@ importScripts("utils.js");
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const NATIVE_TRANSCRIBER_HOST = "com.audio_recorder.whisper_host";
 const ANKI_CONNECT_URL = "http://127.0.0.1:8765";
-const ANKI_DECK_NAME = "Audio Immersion";
 const ANKI_MODEL_NAME = "Basic";
 const ANKI_FRONT_FIELD = "Front";
 const ANKI_BACK_FIELD = "Back";
+const GOOGLE_TRANSLATE_URL = "https://translate.google.com/";
+const GOOGLE_TRANSLATE_HOST_PERMISSION = "https://translate.google.com/*";
+const GOOGLE_TRANSLATE_TIMEOUT_MS = 20000;
 
 let offscreenCreationPromise = null;
 
@@ -50,7 +52,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.action === "STOP" ||
     message?.action === "BROWSE_PATH" ||
     message?.action === "FLUSH_QUEUE" ||
-    message?.action === "GET_QUEUE_STATUS"
+    message?.action === "GET_QUEUE_STATUS" ||
+    message?.action === "GET_QUEUE_ITEMS" ||
+    message?.action === "DROP_QUEUE_ITEM"
   ) {
     handleControlMessage(message)
       .then((response) => sendResponse(response))
@@ -121,6 +125,28 @@ async function handleControlMessage(message) {
 
   if (message.action === "FLUSH_QUEUE") {
     return flushQueuedAnkiCards();
+  }
+
+  if (message.action === "GET_QUEUE_ITEMS") {
+    const result = await requestNativeQueueItems();
+    return { ok: true, items: result.items || [] };
+  }
+
+  if (message.action === "DROP_QUEUE_ITEM") {
+    const result = await requestNativeDropQueueItem(message.jobId);
+    const queueState = await setAnkiQueueState({
+      pendingCount: Number(result.pendingCount || 0),
+      isSyncing: false,
+      statusText: buildQueueCountText(result.pendingCount || 0),
+      errorText: "",
+      lastUpdatedAt: Date.now(),
+    });
+
+    return {
+      ok: true,
+      queueState,
+      items: result.items || [],
+    };
   }
 
   return { ok: false, error: "Unknown control message." };
@@ -255,6 +281,8 @@ async function handleRecordingStarted(startedAt) {
 async function handleRecordingComplete(message) {
   const recorderState = await getRecorderState();
   const transcriptionSettings = await getTranscriptionSettings();
+  const translationSettings = await getTranslationSettings();
+  const outputDirectory = await getOutputDirectory();
   const durationMs = message.durationMs || 0;
   const primaryBlob = await getRecordingBlob(message.blobId);
 
@@ -274,13 +302,27 @@ async function handleRecordingComplete(message) {
 
   await deleteRecordingBlob(message.blobId);
 
-  const audioPath = primaryDownload.filename;
-  const transcriptPath = `${stripFileExtension(audioPath)}.txt`;
+  let audioPath = primaryDownload.filename;
+  let saveLocationError = "";
   const configError = getTranscriptionConfigurationError(transcriptionSettings);
   const shouldTranscribe = message.transcriptionRequested && !configError;
   let temporaryDownload = null;
 
   try {
+    if (outputDirectory) {
+      try {
+        audioPath = await requestNativeMoveFile({
+          sourcePath: primaryDownload.filename,
+          targetDirectory: outputDirectory,
+          targetFilename: getFilenameFromPath(primaryDownload.filename),
+        });
+      } catch (error) {
+        saveLocationError = error.message || "The selected save folder could not be used.";
+      }
+    }
+
+    const transcriptPath = `${stripFileExtension(audioPath)}.txt`;
+
     if (shouldTranscribe) {
       let sourceAudioPath = audioPath;
 
@@ -329,36 +371,84 @@ async function handleRecordingComplete(message) {
         transcriptPath,
         language: transcriptionSettings.language,
         recordingName: getFileStem(audioPath),
+        ankiDeckName: transcriptionSettings.ankiDeckName,
+        ankiEnabled: !translationSettings.enabled,
       });
-      await updateQueueStateFromTranscriptionResult(transcriptionResult);
 
       const finalTranscriptPath = transcriptionResult.transcriptPath || transcriptPath;
-      const ankiStatus = transcriptionResult.anki?.status || "skipped";
-      const ankiMessage = transcriptionResult.anki?.message || "";
+      const transcriptText = String(transcriptionResult.transcriptText || "").trim();
+      let translatedText = "";
+      let translationError = "";
+      let finalAnkiResult = transcriptionResult;
       let completionTitle = "Transcript ready";
       let completionMessage = `Saved to ${finalTranscriptPath}`;
       let statusText = `Transcript saved to ${finalTranscriptPath}`;
 
-      if (ankiStatus === "created") {
-        completionTitle = "New card created successfully";
-        completionMessage = `Added to ${ANKI_DECK_NAME}`;
-        statusText = `Transcript saved to ${finalTranscriptPath}. New card created successfully.`;
-      } else if (ankiStatus === "queued") {
-        const pendingCount = Number(transcriptionResult.pendingCount || 0);
-        completionTitle = "Anki offline, card queued";
+      if (translationSettings.enabled) {
+        await setRecorderState({
+          isRecording: false,
+          isProcessing: true,
+          startedAt: null,
+          stoppedAt: Date.now(),
+          lastDurationMs: durationMs,
+          lastAudioPath: audioPath,
+          lastTranscriptPath: finalTranscriptPath,
+          statusText: "Transcript ready. Waiting for Google Translate...",
+          errorText: "",
+        });
+
+        const translationResult = await captureGoogleTranslateTranslation(
+          transcriptText,
+        );
+        translatedText = translationResult.translatedText;
+        translationError = translationResult.errorText;
+      }
+
+      finalAnkiResult = await requestNativeQueueAnkiCard({
+        audioPath,
+        transcriptPath: finalTranscriptPath,
+        transcriptText,
+        translatedText,
+        recordingName: getFileStem(audioPath),
+        ankiDeckName: transcriptionSettings.ankiDeckName,
+      });
+
+      await updateQueueStateFromTranscriptionResult(finalAnkiResult);
+
+      const ankiStatus = finalAnkiResult.anki?.status || "skipped";
+      const ankiMessage = finalAnkiResult.anki?.message || "";
+      const translationCaptured = Boolean(translatedText);
+      const translationSuffix = buildTranslationStatusSuffix({
+        enabled: translationSettings.enabled,
+        translatedText,
+        translationError,
+      });
+
+      if (ankiStatus === "queued") {
+        const pendingCount = Number(finalAnkiResult.pendingCount || 0);
+        completionTitle = "Card queued for Anki";
         completionMessage =
           pendingCount > 0
-            ? `${pendingCount} queued card${pendingCount === 1 ? "" : "s"} waiting for Anki.`
-            : "Card queued for Anki.";
-        statusText = `Transcript saved to ${finalTranscriptPath}. Card queued for Anki.`;
-      } else if (ankiStatus === "offline") {
-        completionTitle = "Anki offline";
-        completionMessage = "Transcript saved locally. Open Anki to add cards.";
-        statusText = `Transcript saved to ${finalTranscriptPath}. Anki offline.`;
+            ? `${pendingCount} queued card${pendingCount === 1 ? "" : "s"} waiting for manual push.`
+            : "Card queued for manual push.";
+        statusText = `Transcript saved to ${finalTranscriptPath}. Card queued for manual push.${translationSuffix}`;
       } else if (ankiStatus === "error") {
-        completionTitle = "Anki card failed";
-        completionMessage = ankiMessage || "Transcript saved, but the Anki card was not created.";
-        statusText = `Transcript saved to ${finalTranscriptPath}. ${completionMessage}`;
+        completionTitle = "Anki queue failed";
+        completionMessage = ankiMessage || "Transcript saved, but the card could not be queued.";
+        statusText = `Transcript saved to ${finalTranscriptPath}. ${completionMessage}${translationSuffix}`;
+      } else {
+        statusText = `Transcript saved to ${finalTranscriptPath}.${translationSuffix}`;
+      }
+
+      if (translationSettings.enabled && translationError) {
+        completionMessage = `${completionMessage} Google Translate could not be read, so the transcript-only note was used.`;
+      } else if (translationCaptured) {
+        completionMessage = `${completionMessage} Google Translate output was captured.`;
+      }
+
+      if (saveLocationError) {
+        completionMessage = `${completionMessage} Saved audio in the fallback Downloads location because the selected folder could not be used.`;
+        statusText = `${statusText} Saved audio in the fallback Downloads location because the selected folder could not be used: ${saveLocationError}`;
       }
 
       await cleanupTemporaryDownload(temporaryDownload?.id);
@@ -396,7 +486,9 @@ async function handleRecordingComplete(message) {
     const statusText =
       message.transcriptionRequested && configError
         ? `Saved audio. ${configError}`
-        : `Saved to Downloads/${relativeAudioFilename}`;
+        : saveLocationError
+          ? `Saved to ${audioPath}. The selected save folder could not be used: ${saveLocationError}`
+          : `Saved to ${audioPath}`;
 
     await setRecorderState({
       isRecording: false,
@@ -433,7 +525,9 @@ async function handleRecordingComplete(message) {
       lastDurationMs: 0,
       lastAudioPath: audioPath,
       lastTranscriptPath: null,
-      statusText: `Saved to Downloads/${relativeAudioFilename}`,
+      statusText: saveLocationError
+        ? `Saved to ${audioPath}. The selected save folder could not be used: ${saveLocationError}`
+        : `Saved to ${audioPath}`,
       errorText: `Audio saved, but transcription failed: ${error.message || "Unknown transcription error."}`,
     });
 
@@ -674,8 +768,31 @@ async function requestNativeTranscription(options) {
     transcriptPath: options.transcriptPath,
     language: options.language,
     recordingName: options.recordingName,
-    anki: buildNativeAnkiConfig(),
+    anki: buildNativeAnkiConfig(options),
   });
+}
+
+async function requestNativeQueueAnkiCard(options) {
+  try {
+    return await requestNativeHostMessage({
+      type: "queue-anki-card",
+      audioPath: options.audioPath,
+      transcriptPath: options.transcriptPath,
+      transcriptText: options.transcriptText,
+      translatedText: options.translatedText,
+      recordingName: options.recordingName,
+      anki: buildNativeAnkiConfig(options),
+    });
+  } catch (error) {
+    const queueState = await syncAnkiQueueState({ suppressErrors: true });
+    return {
+      anki: {
+        status: "error",
+        message: error.message || "Anki card queueing failed.",
+      },
+      pendingCount: queueState.pendingCount || 0,
+    };
+  }
 }
 
 async function requestNativeQueueStatus() {
@@ -690,6 +807,30 @@ async function requestNativeQueueFlush() {
   });
 }
 
+async function requestNativeQueueItems() {
+  return requestNativeHostMessage({
+    type: "queue-items",
+  });
+}
+
+async function requestNativeDropQueueItem(jobId) {
+  return requestNativeHostMessage({
+    type: "drop-queue-item",
+    jobId,
+  });
+}
+
+async function requestNativeMoveFile(options) {
+  const result = await requestNativeHostMessage({
+    type: "move-file",
+    sourcePath: options.sourcePath,
+    targetDirectory: options.targetDirectory,
+    targetFilename: options.targetFilename,
+  });
+
+  return String(result.destinationPath || "").trim();
+}
+
 async function requestNativePathSelection(options = {}) {
   const result = await requestNativeHostMessage({
     type: "pick-path",
@@ -700,11 +841,11 @@ async function requestNativePathSelection(options = {}) {
   return String(result.selectedPath || "").trim();
 }
 
-function buildNativeAnkiConfig() {
+function buildNativeAnkiConfig(options = {}) {
   return {
-    enabled: true,
+    enabled: options.ankiEnabled !== false,
     connectUrl: ANKI_CONNECT_URL,
-    deckName: ANKI_DECK_NAME,
+    deckName: String(options.ankiDeckName || "").trim(),
     modelName: ANKI_MODEL_NAME,
     frontField: ANKI_FRONT_FIELD,
     backField: ANKI_BACK_FIELD,
@@ -788,8 +929,8 @@ async function updateQueueStateFromTranscriptionResult(result) {
   if (result?.anki?.status === "queued") {
     statusText =
       pendingCount > 0
-        ? `${pendingCount} queued card${pendingCount === 1 ? "" : "s"} waiting for Anki.`
-        : "Card queued for Anki.";
+        ? `${pendingCount} queued card${pendingCount === 1 ? "" : "s"} waiting for manual push.`
+        : "Card queued for manual push.";
   }
 
   if (result?.anki?.status === "error" && result?.anki?.message) {
@@ -900,13 +1041,428 @@ function buildQueueCountText(pendingCount) {
     return "Queue empty.";
   }
 
-  return `${count} queued card${count === 1 ? "" : "s"} waiting for Anki.`;
+  return `${count} queued card${count === 1 ? "" : "s"} waiting for manual push.`;
 }
 
 function isMissingReceiverError(error) {
   return String(error?.message || error || "").includes(
     "Receiving end does not exist",
   );
+}
+
+async function captureGoogleTranslateTranslation(transcriptText) {
+  const normalizedTranscript = String(transcriptText || "").trim();
+
+  if (!normalizedTranscript) {
+    return {
+      translatedText: "",
+      errorText: "The transcript was empty.",
+    };
+  }
+
+  const hasPermission = await chrome.permissions.contains({
+    origins: [GOOGLE_TRANSLATE_HOST_PERMISSION],
+  });
+
+  if (!hasPermission) {
+    return {
+      translatedText: "",
+      errorText: "Google Translate permission is missing.",
+    };
+  }
+
+  try {
+    const tab = await getOrCreateGoogleTranslateTab();
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async (sourceText, timeoutMs) => {
+        const stableWindowMs = 1200;
+
+        function normalizeText(value) {
+          return String(value || "")
+            .replace(/\r\n/g, "\n")
+            .replace(/\r/g, "\n")
+            .replace(/\u00a0/g, " ")
+            .replace(/[ \t]+\n/g, "\n")
+            .replace(/\n{3,}/g, "\n\n")
+            .trim();
+        }
+
+        function stripStarBorder(value) {
+          return normalizeText(
+            String(value || "").replace(/\bstar_border\b/gi, " "),
+          );
+        }
+
+        function isVisible(element) {
+          if (!element) {
+            return false;
+          }
+
+          const rect = element.getBoundingClientRect();
+          const style = window.getComputedStyle(element);
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            style.opacity !== "0"
+          );
+        }
+
+        function isEditable(element) {
+          if (!element) {
+            return false;
+          }
+
+          return (
+            element instanceof HTMLTextAreaElement ||
+            element instanceof HTMLInputElement ||
+            element.isContentEditable ||
+            element.getAttribute("role") === "textbox"
+          );
+        }
+
+        function getInputCandidates() {
+          return Array.from(
+            document.querySelectorAll(
+              "textarea, input[type='text'], [contenteditable='true'], [role='textbox']",
+            ),
+          )
+            .filter((element) => isEditable(element) && isVisible(element))
+            .map((element) => {
+              const rect = element.getBoundingClientRect();
+              const label = String(
+                element.getAttribute("aria-label") ||
+                  element.getAttribute("data-placeholder") ||
+                  element.getAttribute("placeholder") ||
+                  "",
+              ).toLowerCase();
+              let score = 0;
+
+              if (rect.left < window.innerWidth * 0.6) {
+                score += 40;
+              }
+
+              if (rect.width >= 120) {
+                score += 20;
+              }
+
+              if (rect.height >= 32) {
+                score += 15;
+              }
+
+              if (
+                label.includes("source") ||
+                label.includes("translate") ||
+                label.includes("text")
+              ) {
+                score += 30;
+              }
+
+              return {
+                element,
+                score,
+              };
+            })
+            .sort((left, right) => right.score - left.score);
+        }
+
+        async function waitForInputElement() {
+          const deadline = Date.now() + timeoutMs;
+
+          while (Date.now() < deadline) {
+            const candidate = getInputCandidates()[0];
+            if (candidate?.element) {
+              return candidate.element;
+            }
+
+            await new Promise((resolve) => {
+              window.setTimeout(resolve, 150);
+            });
+          }
+
+          throw new Error("Google Translate input field was not found in time.");
+        }
+
+        function setInputText(element, value) {
+          const text = String(value || "");
+          element.focus();
+
+          if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+            const prototype =
+              element instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+            const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+            if (descriptor?.set) {
+              descriptor.set.call(element, text);
+            } else {
+              element.value = text;
+            }
+          } else if (element.isContentEditable || element.getAttribute("role") === "textbox") {
+            const selection = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            if (!document.execCommand("insertText", false, text)) {
+              element.textContent = text;
+            }
+          }
+
+          element.dispatchEvent(
+            new InputEvent("input", {
+              bubbles: true,
+              data: text,
+              inputType: "insertText",
+            }),
+          );
+          element.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+
+        function wait(ms) {
+          return new Promise((resolve) => {
+            window.setTimeout(resolve, ms);
+          });
+        }
+
+        function getTranslatedTextFromSendFeedbackAnchor() {
+          const target = Array.from(document.querySelectorAll("span")).find(
+            (element) =>
+              isVisible(element) &&
+              String(element.textContent || "").trim() === "Send feedback",
+          );
+          const outerSpan = target?.closest("span");
+          const prevDiv = outerSpan?.previousElementSibling;
+          const copyDiv = prevDiv?.querySelector('div[jsaction^="copy:"]');
+          const text = stripStarBorder(copyDiv?.innerText || copyDiv?.textContent || "");
+
+          return {
+            copyDiv,
+            text,
+          };
+        }
+
+        const inputElement = await waitForInputElement();
+        const normalizedSource = normalizeText(sourceText);
+        const baselineText = getTranslatedTextFromSendFeedbackAnchor().text;
+
+        setInputText(inputElement, "");
+        await wait(150);
+        setInputText(inputElement, normalizedSource);
+
+        return new Promise((resolve, reject) => {
+          const startedAt = Date.now();
+          let lastText = "";
+          let lastChangedAt = Date.now();
+          let sawEmptyOutput = false;
+          let sawNewTranslationText = false;
+          let settled = false;
+          let activeCopyNode = null;
+          let timeoutTimer = 0;
+          let copyObserver = null;
+          let rootObserver = null;
+
+          function cleanup() {
+            if (copyObserver) {
+              copyObserver.disconnect();
+            }
+            if (rootObserver) {
+              rootObserver.disconnect();
+            }
+            window.clearTimeout(timeoutTimer);
+          }
+
+          function finish(result) {
+            if (settled) {
+              return;
+            }
+
+            settled = true;
+            cleanup();
+            resolve(result);
+          }
+
+          function fail(message) {
+            if (settled) {
+              return;
+            }
+
+            settled = true;
+            cleanup();
+            reject(new Error(message));
+          }
+
+          function bindCopyObserver() {
+            const currentState = getTranslatedTextFromSendFeedbackAnchor();
+
+            if (!currentState.copyDiv || currentState.copyDiv === activeCopyNode) {
+              return currentState;
+            }
+
+            if (copyObserver) {
+              copyObserver.disconnect();
+            }
+
+            activeCopyNode = currentState.copyDiv;
+            copyObserver = new MutationObserver(() => {
+              sample();
+            });
+            copyObserver.observe(activeCopyNode, {
+              childList: true,
+              subtree: true,
+              characterData: true,
+            });
+
+            return currentState;
+          }
+
+          function sample() {
+            const currentState = bindCopyObserver();
+            const currentText = currentState.text;
+
+            if (!currentText) {
+              sawEmptyOutput = true;
+              return;
+            }
+
+            if (!sawNewTranslationText && currentText !== baselineText) {
+              sawNewTranslationText = true;
+            }
+
+            if (!sawNewTranslationText && !sawEmptyOutput) {
+              return;
+            }
+
+            if (currentText !== lastText) {
+              lastText = currentText;
+              lastChangedAt = Date.now();
+              return;
+            }
+
+            if (Date.now() - lastChangedAt >= stableWindowMs) {
+              finish(currentText);
+            }
+          }
+
+          rootObserver = new MutationObserver(() => {
+            sample();
+          });
+          rootObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+          });
+
+          timeoutTimer = window.setTimeout(() => {
+            const currentState = getTranslatedTextFromSendFeedbackAnchor();
+            const currentText = currentState.text;
+            if (currentText) {
+              if (currentText !== baselineText || sawEmptyOutput || !baselineText) {
+                finish(currentText);
+                return;
+              }
+            }
+
+            const currentInputText =
+              inputElement instanceof HTMLTextAreaElement ||
+              inputElement instanceof HTMLInputElement
+                ? normalizeText(inputElement.value)
+                : normalizeText(
+                    inputElement.innerText || inputElement.textContent || "",
+                  );
+
+            if (!currentInputText) {
+              fail("Google Translate input was blank.");
+              return;
+            }
+
+            fail("Google Translate has not produced a fresh translated text yet.");
+          }, timeoutMs);
+
+          sample();
+        });
+      },
+      args: [normalizedTranscript, GOOGLE_TRANSLATE_TIMEOUT_MS],
+    });
+
+    return {
+      translatedText: String(result || "").trim(),
+      errorText: "",
+    };
+  } catch (error) {
+    return {
+      translatedText: "",
+      errorText:
+        error.message || "Google Translate could not be read for this transcript.",
+    };
+  }
+}
+
+async function getOrCreateGoogleTranslateTab() {
+  const [existingTab] = await chrome.tabs.query({
+    url: [GOOGLE_TRANSLATE_HOST_PERMISSION],
+  });
+
+  if (existingTab?.id) {
+    await waitForTabComplete(existingTab.id);
+    return existingTab;
+  }
+
+  const createdTab = await chrome.tabs.create({
+    url: GOOGLE_TRANSLATE_URL,
+    active: false,
+  });
+
+  await waitForTabComplete(createdTab.id);
+  return createdTab;
+}
+
+async function waitForTabComplete(tabId) {
+  if (!tabId) {
+    throw new Error("Google Translate tab could not be created.");
+  }
+
+  const currentTab = await chrome.tabs.get(tabId);
+  if (currentTab.status === "complete") {
+    return;
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error("Google Translate did not finish loading in time."));
+    }, 15000);
+
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId || changeInfo.status !== "complete") {
+        return;
+      }
+
+      clearTimeout(timeoutId);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+function buildTranslationStatusSuffix(options = {}) {
+  if (!options.enabled) {
+    return "";
+  }
+
+  if (options.translatedText) {
+    return " Google Translate output captured.";
+  }
+
+  if (options.translationError) {
+    return ` Google Translate fallback used: ${options.translationError}`;
+  }
+
+  return "";
 }
 
 async function requestRecordingName(tabId) {

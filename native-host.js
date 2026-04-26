@@ -46,8 +46,28 @@ async function handleNativeMessage(message) {
     return flushAnkiQueue();
   }
 
+  if (message?.type === "queue-items") {
+    return getAnkiQueueItems();
+  }
+
+  if (message?.type === "drop-queue-item") {
+    return dropAnkiQueueItem(message);
+  }
+
+  if (message?.type === "move-file") {
+    return moveFile(message);
+  }
+
   if (message?.type === "pick-path") {
     return pickPath(message);
+  }
+
+  if (message?.type === "queue-anki-card") {
+    return queueStandaloneAnkiCard(message);
+  }
+
+  if (message?.type === "create-anki-card") {
+    return createStandaloneAnkiCard(message);
   }
 
   if (message?.type !== "process-recording") {
@@ -56,27 +76,14 @@ async function handleNativeMessage(message) {
 
   const job = normalizeJob(message);
   const result = await runWhisperTranscription(job);
-  const ankiJob = await buildAnkiJob(job, result.transcriptPath);
-  let anki = { status: "skipped" };
-
-  if (job.anki.enabled) {
-    anki = await createAnkiCard(ankiJob);
-
-    if (anki.status === "offline") {
-      const queueResult = await enqueueAnkiJob(ankiJob);
-      anki = {
-        status: "queued",
-        message: "Anki offline. Card queued for later.",
-        queueId: queueResult.jobId,
-      };
-    }
-  }
+  const transcriptText = await readTranscriptText(result.transcriptPath);
 
   const queueStatus = await getAnkiQueueStatus();
 
   return {
     transcriptPath: result.transcriptPath,
-    anki,
+    transcriptText,
+    anki: { status: "skipped" },
     pendingCount: queueStatus.pendingCount,
   };
 }
@@ -87,6 +94,76 @@ async function pickPath(message) {
 
   return {
     selectedPath,
+  };
+}
+
+async function moveFile(message) {
+  const request = normalizeMoveFileRequest(message);
+  const destinationPath = await moveFileToDirectory(request);
+
+  return {
+    destinationPath,
+  };
+}
+
+async function createStandaloneAnkiCard(message) {
+  const request = normalizeAnkiCardRequest(message);
+  const ankiJob = await buildAnkiJob(
+    {
+      audioPath: request.audioPath,
+      recordingName: request.recordingName,
+      anki: request.anki,
+    },
+    request.transcriptPath,
+    {
+      transcriptText: request.transcriptText,
+      translatedText: request.translatedText,
+      jobId: request.jobId,
+    },
+  );
+  let anki = await createAnkiCard(ankiJob);
+
+  if (anki.status === "offline") {
+    const queueResult = await enqueueAnkiJob(ankiJob);
+    anki = {
+      status: "queued",
+      message: "Anki offline. Card queued for later.",
+      queueId: queueResult.jobId,
+    };
+  }
+
+  const queueStatus = await getAnkiQueueStatus();
+
+  return {
+    anki,
+    pendingCount: queueStatus.pendingCount,
+  };
+}
+
+async function queueStandaloneAnkiCard(message) {
+  const request = normalizeAnkiCardRequest(message);
+  const ankiJob = await buildAnkiJob(
+    {
+      audioPath: request.audioPath,
+      recordingName: request.recordingName,
+      anki: request.anki,
+    },
+    request.transcriptPath,
+    {
+      transcriptText: request.transcriptText,
+      translatedText: request.translatedText,
+      jobId: request.jobId,
+    },
+  );
+  const queueResult = await enqueueAnkiJob(ankiJob);
+
+  return {
+    anki: {
+      status: "queued",
+      message: "Card queued for manual push.",
+      queueId: queueResult.jobId,
+    },
+    pendingCount: queueResult.pendingCount,
   };
 }
 
@@ -181,20 +258,81 @@ function normalizeAnkiConfig(anki) {
 }
 
 function normalizePathPickerRequest(message) {
-  const kind = message?.kind === "model" ? "model" : "cli";
+  const kind =
+    message?.kind === "model"
+      ? "model"
+      : message?.kind === "output-directory"
+        ? "output-directory"
+        : "cli";
   const currentPath = String(message?.currentPath || "").trim();
 
   return {
     kind,
     currentPath,
     title:
-      kind === "model"
+      kind === "output-directory"
+        ? "Select output folder"
+        : kind === "model"
         ? "Select Whisper model file"
         : "Select whisper-cli executable",
     filter:
-      kind === "model"
+      kind === "output-directory"
+        ? ""
+        : kind === "model"
         ? "Whisper model (*.bin)|*.bin|All files (*.*)|*.*"
         : "Executable (*.exe)|*.exe|All files (*.*)|*.*",
+  };
+}
+
+function normalizeMoveFileRequest(message) {
+  const sourcePath = String(message?.sourcePath || "").trim();
+  const targetDirectory = String(message?.targetDirectory || "").trim();
+  const targetFilename = path.basename(String(message?.targetFilename || "").trim());
+
+  if (!sourcePath || !path.isAbsolute(sourcePath)) {
+    throw new Error("The source file path is invalid.");
+  }
+
+  if (!targetDirectory || !path.isAbsolute(targetDirectory)) {
+    throw new Error("The selected save folder is invalid.");
+  }
+
+  if (!targetFilename) {
+    throw new Error("The target file name is invalid.");
+  }
+
+  return {
+    sourcePath,
+    targetDirectory,
+    targetFilename,
+  };
+}
+
+function normalizeAnkiCardRequest(message) {
+  const audioPath = String(message?.audioPath || "").trim();
+  const transcriptPath = String(message?.transcriptPath || "").trim();
+  const transcriptText = String(message?.transcriptText || "");
+  const translatedText = String(message?.translatedText || "");
+  const recordingName = sanitizeName(message?.recordingName || "");
+  const anki = normalizeAnkiConfig(message?.anki);
+  const jobId = String(message?.jobId || "").trim();
+
+  if (!audioPath || !path.isAbsolute(audioPath)) {
+    throw new Error("The audio file path is invalid.");
+  }
+
+  if (!transcriptPath || !path.isAbsolute(transcriptPath)) {
+    throw new Error("The transcript path is invalid.");
+  }
+
+  return {
+    audioPath,
+    transcriptPath,
+    transcriptText,
+    translatedText,
+    recordingName,
+    anki,
+    jobId,
   };
 }
 
@@ -233,9 +371,11 @@ async function runWhisperTranscription(job) {
   };
 }
 
-async function buildAnkiJob(job, transcriptPath) {
-  const jobId = job.jobId || buildJobId();
-  const transcriptText = await readTranscriptText(transcriptPath);
+async function buildAnkiJob(job, transcriptPath, options = {}) {
+  const jobId = options.jobId || job.jobId || buildJobId();
+  const transcriptText =
+    String(options.transcriptText || "").trim() || (await readTranscriptText(transcriptPath));
+  const translatedText = normalizeMultilineText(options.translatedText);
 
   return {
     jobId,
@@ -249,7 +389,8 @@ async function buildAnkiJob(job, transcriptPath) {
     audioPath: job.audioPath,
     transcriptPath,
     transcriptText,
-    transcriptHtml: formatTranscriptForAnkiField(transcriptText),
+    translatedText,
+    transcriptHtml: formatTranscriptForAnkiField(transcriptText, translatedText),
     mediaFilename:
       job.mediaFilename || buildAnkiMediaFilename(job.audioPath, job.recordingName),
     tags: job.tags || [...DEFAULT_ANKI_TAGS, buildJobTag(jobId)],
@@ -279,9 +420,10 @@ async function createAnkiCard(job) {
       encoding: "base64",
     });
 
-    await invokeAnki(job.connectUrl, "createDeck", {
-      deck: job.deckName,
-    });
+    const deckNames = await invokeAnki(job.connectUrl, "deckNames");
+    if (!Array.isArray(deckNames) || !deckNames.includes(job.deckName)) {
+      throw new Error("The Anki deck name is incorrect.");
+    }
 
     await invokeAnki(job.connectUrl, "storeMediaFile", {
       filename: job.mediaFilename,
@@ -445,6 +587,55 @@ async function getAnkiQueueStatus() {
   };
 }
 
+async function getAnkiQueueItems() {
+  const queue = await readAnkiQueue();
+
+  return {
+    pendingCount: queue.length,
+    items: queue.map((item) => ({
+      jobId: item.jobId,
+      recordingName: item.recordingName || "recording",
+      queuedAt: item.queuedAt || "",
+      retryCount: Number(item.retryCount || 0),
+      lastError: item.lastError || "",
+      hasTranslation: Boolean(String(item.translatedText || "").trim()),
+    })),
+  };
+}
+
+async function dropAnkiQueueItem(message) {
+  const jobId = String(message?.jobId || "").trim().toLowerCase();
+  if (!jobId) {
+    throw new Error("The queued recording ID is missing.");
+  }
+
+  const queue = await readAnkiQueue();
+  const keptItems = [];
+
+  for (const item of queue) {
+    if (String(item.jobId || "").trim().toLowerCase() === jobId) {
+      await cleanupQueuedAudioFile(item.audioPath);
+      continue;
+    }
+
+    keptItems.push(item);
+  }
+
+  await writeAnkiQueue(keptItems);
+
+  return {
+    pendingCount: keptItems.length,
+    items: keptItems.map((item) => ({
+      jobId: item.jobId,
+      recordingName: item.recordingName || "recording",
+      queuedAt: item.queuedAt || "",
+      retryCount: Number(item.retryCount || 0),
+      lastError: item.lastError || "",
+      hasTranslation: Boolean(String(item.translatedText || "").trim()),
+    })),
+  };
+}
+
 async function readAnkiQueue() {
   try {
     const raw = await fs.promises.readFile(ANKI_QUEUE_FILE, "utf8");
@@ -523,6 +714,10 @@ async function showPathPicker(request) {
     throw new Error("Path browsing is currently supported only on Windows.");
   }
 
+  if (request.kind === "output-directory") {
+    return showDirectoryPicker(request);
+  }
+
   const currentPath = String(request.currentPath || "").trim();
   const initialDirectory =
     currentPath && path.isAbsolute(currentPath)
@@ -565,21 +760,110 @@ async function showPathPicker(request) {
   return String(result.stdout || "").trim();
 }
 
+async function showDirectoryPicker(request) {
+  const currentPath = String(request.currentPath || "").trim();
+
+  const command = [
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
+    `$dialog.Description = '${escapePowerShellString(request.title)}'`,
+    "$dialog.ShowNewFolderButton = $true",
+    currentPath && path.isAbsolute(currentPath)
+      ? `$dialog.SelectedPath = '${escapePowerShellString(currentPath)}'`
+      : "",
+    "$result = $dialog.ShowDialog()",
+    "if ($result -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }",
+  ]
+    .filter(Boolean)
+    .join("; ");
+
+  const result = await spawnProcess("powershell.exe", [
+    "-NoProfile",
+    "-STA",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    command,
+  ]);
+
+  return String(result.stdout || "").trim();
+}
+
+async function moveFileToDirectory(request) {
+  await fs.promises.mkdir(request.targetDirectory, { recursive: true });
+  const destinationPath = await resolveUniquePath(
+    path.join(request.targetDirectory, request.targetFilename),
+  );
+
+  try {
+    await fs.promises.rename(request.sourcePath, destinationPath);
+  } catch (error) {
+    if (error?.code !== "EXDEV") {
+      throw new Error("The selected save folder could not be used.");
+    }
+
+    await fs.promises.copyFile(request.sourcePath, destinationPath);
+    await fs.promises.unlink(request.sourcePath);
+  }
+
+  return destinationPath;
+}
+
+async function resolveUniquePath(filePath) {
+  const parsedPath = path.parse(filePath);
+  let candidatePath = filePath;
+  let counter = 1;
+
+  while (await fileExists(candidatePath)) {
+    candidatePath = path.join(
+      parsedPath.dir,
+      `${parsedPath.name} (${counter})${parsedPath.ext}`,
+    );
+    counter += 1;
+  }
+
+  return candidatePath;
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.promises.access(filePath, fs.constants.F_OK);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
 async function readTranscriptText(transcriptPath) {
   const raw = await fs.promises.readFile(transcriptPath, "utf8");
   return raw.replace(/^\uFEFF/, "");
 }
 
-function formatTranscriptForAnkiField(transcriptText) {
-  const normalized = String(transcriptText || "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
+function formatTranscriptForAnkiField(transcriptText, translatedText = "") {
+  const normalizedTranscript = normalizeMultilineText(transcriptText);
+  const normalizedTranslation = normalizeMultilineText(translatedText);
 
-  if (!normalized.trim()) {
+  if (!normalizedTranscript) {
     return "";
   }
 
-  return `<div style="white-space: pre-wrap;">${escapeHtml(normalized)}</div>`;
+  if (!normalizedTranslation) {
+    return `<div style="white-space: pre-wrap;">${escapeHtml(normalizedTranscript)}</div>`;
+  }
+
+  return [
+    `<div style="font-weight: 700; margin-bottom: 6px;">Transcript</div>`,
+    `<div style="white-space: pre-wrap;">${escapeHtml(normalizedTranscript)}</div>`,
+    `<div style="font-weight: 700; margin-top: 12px; margin-bottom: 6px;">Translation</div>`,
+    `<div style="white-space: pre-wrap;">${escapeHtml(normalizedTranslation)}</div>`,
+  ].join("");
+}
+
+function normalizeMultilineText(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim();
 }
 
 function escapeHtml(value) {

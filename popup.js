@@ -4,7 +4,8 @@ const status = document.getElementById("status");
 const timer = document.getElementById("timer");
 const statePill = document.getElementById("statePill");
 const formatSelect = document.getElementById("format");
-const downloadFolderInput = document.getElementById("downloadFolder");
+const outputDirectoryInput = document.getElementById("outputDirectory");
+const browseOutputDirectoryBtn = document.getElementById("browseOutputDirectory");
 const pathHint = document.getElementById("pathHint");
 const transcriptionEnabledInput = document.getElementById("transcriptionEnabled");
 const whisperCliPathInput = document.getElementById("whisperCliPath");
@@ -12,18 +13,26 @@ const whisperModelPathInput = document.getElementById("whisperModelPath");
 const browseWhisperCliPathBtn = document.getElementById("browseWhisperCliPath");
 const browseWhisperModelPathBtn = document.getElementById("browseWhisperModelPath");
 const whisperLanguageInput = document.getElementById("whisperLanguage");
+const ankiDeckNameInput = document.getElementById("ankiDeckName");
+const translationEnabledInput = document.getElementById("translationEnabled");
 const transcriptionFields = document.getElementById("transcriptionFields");
 const queueCount = document.getElementById("queueCount");
 const queueStatus = document.getElementById("queueStatus");
 const pushQueueBtn = document.getElementById("pushQueue");
+const queueList = document.getElementById("queueList");
 
 let currentState = DEFAULT_RECORDER_STATE;
 let currentTranscriptionSettings = DEFAULT_TRANSCRIPTION_SETTINGS;
+let currentTranslationSettings = DEFAULT_TRANSLATION_SETTINGS;
 let currentQueueState = DEFAULT_ANKI_QUEUE_STATE;
+let currentQueueItems = [];
+let currentOutputDirectory = DEFAULT_OUTPUT_DIRECTORY;
 let timerInterval = null;
 let whisperCliPathPersistTimer = null;
 let whisperModelPathPersistTimer = null;
 let whisperLanguagePersistTimer = null;
+let ankiDeckNamePersistTimer = null;
+let outputDirectoryPersistTimer = null;
 
 initializePopup().catch((error) => {
   renderStatus("Unable to load popup settings.", "error");
@@ -78,6 +87,38 @@ pushQueueBtn.addEventListener("click", async () => {
       error.message || "Queued cards could not be pushed.",
       "error",
     );
+  } finally {
+    await refreshQueueItems();
+  }
+});
+
+queueList.addEventListener("click", async (event) => {
+  const dropButton = event.target.closest("[data-queue-drop]");
+  if (!dropButton) {
+    return;
+  }
+
+  dropButton.disabled = true;
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: "DROP_QUEUE_ITEM",
+      jobId: dropButton.dataset.queueDrop,
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "The queued card could not be removed.");
+    }
+
+    currentQueueItems = Array.isArray(response.items) ? response.items : [];
+    renderQueueItems();
+  } catch (error) {
+    renderQueueStatus(
+      error.message || "The queued card could not be removed.",
+      "error",
+    );
+  } finally {
+    await refreshQueueItems();
   }
 });
 
@@ -86,10 +127,18 @@ formatSelect.addEventListener("change", async () => {
   formatSelect.value = nextFormat;
 });
 
-downloadFolderInput.addEventListener("change", async () => {
-  const nextFolder = await setDownloadFolder(downloadFolderInput.value);
-  downloadFolderInput.value = nextFolder;
-  pathHint.textContent = `Saved to Downloads/${nextFolder}`;
+browseOutputDirectoryBtn.addEventListener("click", async () => {
+  await handleDirectoryBrowse();
+});
+
+outputDirectoryInput.addEventListener("change", async () => {
+  const nextDirectory = await setOutputDirectory(outputDirectoryInput.value);
+  currentOutputDirectory = nextDirectory;
+  outputDirectoryInput.value = nextDirectory;
+  renderOutputDirectory();
+});
+outputDirectoryInput.addEventListener("input", () => {
+  schedulePersistedSetting("outputDirectory", outputDirectoryInput.value);
 });
 
 transcriptionEnabledInput.addEventListener("change", async () => {
@@ -104,7 +153,7 @@ whisperCliPathInput.addEventListener("change", async () => {
   });
 });
 whisperCliPathInput.addEventListener("input", () => {
-  schedulePersistedTextSetting("whisperCliPath", whisperCliPathInput.value);
+  schedulePersistedSetting("whisperCliPath", whisperCliPathInput.value);
 });
 
 whisperModelPathInput.addEventListener("change", async () => {
@@ -113,7 +162,7 @@ whisperModelPathInput.addEventListener("change", async () => {
   });
 });
 whisperModelPathInput.addEventListener("input", () => {
-  schedulePersistedTextSetting("whisperModelPath", whisperModelPathInput.value);
+  schedulePersistedSetting("whisperModelPath", whisperModelPathInput.value);
 });
 
 browseWhisperCliPathBtn.addEventListener("click", async () => {
@@ -134,7 +183,36 @@ whisperLanguageInput.addEventListener("change", async () => {
   });
 });
 whisperLanguageInput.addEventListener("input", () => {
-  schedulePersistedTextSetting("language", whisperLanguageInput.value);
+  schedulePersistedSetting("language", whisperLanguageInput.value);
+});
+
+ankiDeckNameInput.addEventListener("change", async () => {
+  await persistTranscriptionSettings({
+    ankiDeckName: ankiDeckNameInput.value,
+  });
+});
+ankiDeckNameInput.addEventListener("input", () => {
+  schedulePersistedSetting("ankiDeckName", ankiDeckNameInput.value);
+});
+
+translationEnabledInput.addEventListener("change", async () => {
+  if (translationEnabledInput.checked) {
+    const granted = await requestGoogleTranslatePermission();
+
+    if (!granted) {
+      translationEnabledInput.checked = false;
+      renderStatus(
+        "Google Translate permission was not granted. Translation stayed off.",
+        "error",
+      );
+      await persistTranslationSettings({ enabled: false });
+      return;
+    }
+  }
+
+  await persistTranslationSettings({
+    enabled: translationEnabledInput.checked,
+  });
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -146,10 +224,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     formatSelect.value = changes.format.newValue || DEFAULT_FORMAT;
   }
 
-  if (changes.downloadFolder) {
-    const nextFolder = sanitizeDownloadFolder(changes.downloadFolder.newValue);
-    downloadFolderInput.value = nextFolder;
-    pathHint.textContent = `Saved to Downloads/${nextFolder}`;
+  if (changes.outputDirectory) {
+    currentOutputDirectory = sanitizeLocalPath(changes.outputDirectory.newValue);
+    renderOutputDirectory();
   }
 
   if (changes.transcriptionSettings) {
@@ -159,12 +236,20 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     renderTranscriptionSettings();
   }
 
+  if (changes.translationSettings) {
+    currentTranslationSettings = normalizeTranslationSettings(
+      changes.translationSettings.newValue
+    );
+    renderTranslationSettings();
+  }
+
   if (changes.ankiQueueState) {
     currentQueueState = {
       ...DEFAULT_ANKI_QUEUE_STATE,
       ...(changes.ankiQueueState.newValue || {}),
     };
     renderQueueState();
+    refreshQueueItems().catch(() => {});
   }
 
   if (changes.recorderState) {
@@ -179,31 +264,79 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 async function initializePopup() {
   await ensureSettings();
 
-  const [format, folder, recorderState, transcriptionSettings, ankiQueueState] =
+  const [
+    format,
+    outputDirectory,
+    recorderState,
+    transcriptionSettings,
+    translationSettings,
+    ankiQueueState,
+  ] =
     await Promise.all([
       getFormat(),
-      getDownloadFolder(),
+      getOutputDirectory(),
       getRecorderState(),
       getTranscriptionSettings(),
+      getTranslationSettings(),
       getAnkiQueueState(),
     ]);
 
   formatSelect.value = format;
-  downloadFolderInput.value = folder;
-  pathHint.textContent = `Saved to Downloads/${folder}`;
+  currentOutputDirectory = outputDirectory;
+  renderOutputDirectory();
   currentState = recorderState;
   currentTranscriptionSettings = transcriptionSettings;
+  currentTranslationSettings = translationSettings;
   currentQueueState = ankiQueueState;
 
   renderTranscriptionSettings();
+  renderTranslationSettings();
   renderQueueState();
+  renderQueueItems();
   renderRecorderState();
   await refreshQueueState();
+  await refreshQueueItems();
 }
 
 async function persistTranscriptionSettings(partialSettings) {
   currentTranscriptionSettings = await updateTranscriptionSettings(partialSettings);
   renderTranscriptionSettings();
+}
+
+async function persistTranslationSettings(partialSettings) {
+  currentTranslationSettings = await updateTranslationSettings(partialSettings);
+  renderTranslationSettings();
+}
+
+async function handleDirectoryBrowse() {
+  const originalLabel = browseOutputDirectoryBtn.textContent;
+
+  browseOutputDirectoryBtn.disabled = true;
+  browseOutputDirectoryBtn.textContent = "Picking...";
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: "BROWSE_PATH",
+      pathKind: "output-directory",
+      currentPath: outputDirectoryInput.value,
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "A folder could not be selected.");
+    }
+
+    if (response.cancelled || !response.path) {
+      return;
+    }
+
+    currentOutputDirectory = await setOutputDirectory(response.path);
+    renderOutputDirectory();
+  } catch (error) {
+    renderStatus(error.message || "A folder could not be selected.", "error");
+  } finally {
+    browseOutputDirectoryBtn.disabled = false;
+    browseOutputDirectoryBtn.textContent = originalLabel;
+  }
 }
 
 async function handlePathBrowse(kind, input, button) {
@@ -240,8 +373,8 @@ async function handlePathBrowse(kind, input, button) {
   }
 }
 
-function schedulePersistedTextSetting(key, value) {
-  const timerKey = `${key}PersistTimer`;
+function schedulePersistedSetting(key, value) {
+  const timerKey = getPersistTimerKey(key);
   const existingTimer = getPersistTimer(timerKey);
 
   if (existingTimer) {
@@ -250,12 +383,33 @@ function schedulePersistedTextSetting(key, value) {
 
   const nextTimer = window.setTimeout(async () => {
     setPersistTimer(timerKey, null);
-    await persistTranscriptionSettings({
-      [key]: value,
-    });
+    if (key === "outputDirectory") {
+      currentOutputDirectory = await setOutputDirectory(value);
+      renderOutputDirectory();
+      return;
+    }
+
+    await persistTranscriptionSettings({ [key]: value });
   }, 250);
 
   setPersistTimer(timerKey, nextTimer);
+}
+
+function getPersistTimerKey(key) {
+  switch (key) {
+    case "whisperCliPath":
+      return "whisperCliPathPersistTimer";
+    case "whisperModelPath":
+      return "whisperModelPathPersistTimer";
+    case "language":
+      return "whisperLanguagePersistTimer";
+    case "ankiDeckName":
+      return "ankiDeckNamePersistTimer";
+    case "outputDirectory":
+      return "outputDirectoryPersistTimer";
+    default:
+      return "";
+  }
 }
 
 function getPersistTimer(timerKey) {
@@ -266,6 +420,10 @@ function getPersistTimer(timerKey) {
       return whisperModelPathPersistTimer;
     case "whisperLanguagePersistTimer":
       return whisperLanguagePersistTimer;
+    case "ankiDeckNamePersistTimer":
+      return ankiDeckNamePersistTimer;
+    case "outputDirectoryPersistTimer":
+      return outputDirectoryPersistTimer;
     default:
       return null;
   }
@@ -282,6 +440,12 @@ function setPersistTimer(timerKey, value) {
     case "whisperLanguagePersistTimer":
       whisperLanguagePersistTimer = value;
       break;
+    case "ankiDeckNamePersistTimer":
+      ankiDeckNamePersistTimer = value;
+      break;
+    case "outputDirectoryPersistTimer":
+      outputDirectoryPersistTimer = value;
+      break;
     default:
       break;
   }
@@ -292,10 +456,22 @@ function renderTranscriptionSettings() {
   whisperCliPathInput.value = currentTranscriptionSettings.whisperCliPath;
   whisperModelPathInput.value = currentTranscriptionSettings.whisperModelPath;
   whisperLanguageInput.value = currentTranscriptionSettings.language;
+  ankiDeckNameInput.value = currentTranscriptionSettings.ankiDeckName;
   transcriptionFields.classList.toggle(
     "muted-block",
     !currentTranscriptionSettings.enabled
   );
+}
+
+function renderTranslationSettings() {
+  translationEnabledInput.checked = currentTranslationSettings.enabled;
+}
+
+function renderOutputDirectory() {
+  outputDirectoryInput.value = currentOutputDirectory;
+  pathHint.textContent = currentOutputDirectory
+    ? `Saved to ${currentOutputDirectory}`
+    : `Saved to Downloads/${DEFAULT_DOWNLOAD_FOLDER}`;
 }
 
 function renderRecorderState() {
@@ -364,6 +540,34 @@ function renderQueueState() {
     : "Push to Anki";
 }
 
+function renderQueueItems() {
+  if (!currentQueueItems.length) {
+    queueList.innerHTML = `<p class="queue-empty">No queued cards.</p>`;
+    return;
+  }
+
+  queueList.innerHTML = currentQueueItems
+    .map((item) => {
+      const queuedAt = formatQueueTimestamp(item.queuedAt);
+      const modeText = item.hasTranslation ? "Transcript + translation" : "Transcript only";
+      const retryText =
+        Number(item.retryCount || 0) > 0
+          ? `Retry ${item.retryCount}`
+          : "Ready";
+
+      return `
+        <div class="queue-item">
+          <div>
+            <div class="queue-item-title">${escapeHtml(item.recordingName || "recording")}</div>
+            <div class="queue-item-meta">${escapeHtml(modeText)} • ${escapeHtml(retryText)}${queuedAt ? ` • ${escapeHtml(queuedAt)}` : ""}</div>
+          </div>
+          <button class="queue-item-drop" type="button" data-queue-drop="${escapeHtml(item.jobId || "")}">Drop</button>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function renderQueueStatus(text, variant) {
   queueStatus.textContent = text;
   queueStatus.className = `hint${variant === "error" ? " error" : ""}`;
@@ -411,4 +615,66 @@ async function refreshQueueState() {
       "error",
     );
   }
+}
+
+async function refreshQueueItems() {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: "GET_QUEUE_ITEMS",
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Queue items could not be loaded.");
+    }
+
+    currentQueueItems = Array.isArray(response.items) ? response.items : [];
+    renderQueueItems();
+  } catch (error) {
+    currentQueueItems = [];
+    renderQueueItems();
+    renderQueueStatus(
+      error.message || "Queue items could not be loaded.",
+      "error",
+    );
+  }
+}
+
+function formatQueueTimestamp(value) {
+  if (!value) {
+    return "";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+
+  return parsed.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function requestGoogleTranslatePermission() {
+  const permissions = {
+    origins: ["https://translate.google.com/*"],
+  };
+
+  const hasPermission = await chrome.permissions.contains(permissions);
+  if (hasPermission) {
+    return true;
+  }
+
+  return chrome.permissions.request(permissions);
 }

@@ -15,6 +15,9 @@
     "tabCapture",
     "tabs"
   ],
+  "optional_host_permissions": [
+    "https://translate.google.com/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },

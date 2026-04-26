@@ -217,20 +217,6 @@
         color: var(--text);
       }
 
-      .prefix-field {
-        display: grid;
-        grid-template-columns: auto 1fr;
-        gap: 8px;
-        align-items: center;
-      }
-
-      .prefix {
-        padding: 10px 0;
-        font-size: 12px;
-        font-weight: 700;
-        color: var(--muted);
-      }
-
       .toggle {
         display: flex;
         align-items: center;
@@ -317,6 +303,53 @@
         color: var(--text);
       }
 
+      .queue-list {
+        margin-top: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .queue-item {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        align-items: center;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(44, 30, 24, 0.05);
+      }
+
+      .queue-item-title {
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .queue-item-meta {
+        margin-top: 4px;
+        font-size: 11px;
+        line-height: 1.4;
+        color: var(--muted);
+      }
+
+      .queue-item-drop {
+        min-width: 70px;
+        padding: 8px 10px;
+        border: 1px solid rgba(143, 38, 31, 0.14);
+        background: rgba(143, 38, 31, 0.08);
+        color: var(--danger);
+      }
+
+      .queue-empty {
+        margin: 0;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
       .hint.error {
         color: var(--danger);
       }
@@ -358,17 +391,21 @@
         </div>
 
         <div class="field">
-          <label for="downloadFolder">Download folder</label>
-          <div class="prefix-field">
-            <span class="prefix">Downloads/</span>
+          <label for="outputDirectory">Save location</label>
+          <div class="path-input-row">
             <input
-              id="downloadFolder"
+              id="outputDirectory"
               type="text"
-              placeholder="TabRecordings"
+              placeholder="Leave blank to save inside Downloads\\TabRecordings"
               autocomplete="off"
             />
+            <button id="browseOutputDirectory" class="browse-button" type="button">
+              Browse
+            </button>
           </div>
-          <p id="pathHint" class="hint">Saved inside your Downloads folder.</p>
+          <p id="pathHint" class="hint">
+            Leave blank to save inside your Downloads folder.
+          </p>
         </div>
       </section>
 
@@ -422,6 +459,16 @@
               autocomplete="off"
             />
           </div>
+
+          <div class="field">
+            <label for="ankiDeckName">Anki deck name</label>
+            <input
+              id="ankiDeckName"
+              type="text"
+              placeholder="Audio Immersion"
+              autocomplete="off"
+            />
+          </div>
         </div>
 
         <p class="hint">
@@ -431,15 +478,36 @@
           window open.
         </p>
         <p class="hint">
-          Successful jobs also try to create an Anki card in
-          <code>Audio Immersion</code> with the audio on the front and the
-          transcript on the back. If Anki is closed, the transcript is still
-          saved and you will see <code>Anki offline</code>.
+          Successful jobs also try to create an Anki card in the deck name you
+          choose, with the audio on the front and the transcript on the back.
+          If the deck name does not exist in Anki, card creation fails but the
+          recording and transcript still save locally.
         </p>
         <p class="hint">
           A strong starting point is <code>ggml-large-v3.bin</code> for better
           accuracy, but it is noticeably heavier and slower than smaller models
           on CPU.
+        </p>
+      </section>
+
+      <section class="section">
+        <p class="section-title">Translation</p>
+
+        <div class="field">
+          <label class="toggle">
+            <input id="translationEnabled" type="checkbox" />
+            <span>Capture Google Translate output</span>
+          </label>
+        </div>
+
+        <p class="hint">
+          When enabled, the extension opens or reuses
+          <code>https://translate.google.com</code>, pastes the transcript,
+          waits for the translated text, and uses it in Anki when available.
+        </p>
+        <p class="hint">
+          If Google Translate cannot be read or permission is not granted, the
+          extension falls back to the current transcript-only Anki behavior.
         </p>
       </section>
 
@@ -453,6 +521,9 @@
           <button id="pushQueue" type="button">Push to Anki</button>
         </div>
         <p id="queueStatus" class="hint">Queue empty.</p>
+        <div id="queueList" class="queue-list">
+          <p class="queue-empty">No queued cards.</p>
+        </div>
       </section>
 
       <section class="section">

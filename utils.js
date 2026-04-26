@@ -1,10 +1,16 @@
 const DEFAULT_FORMAT = "webm";
 const DEFAULT_DOWNLOAD_FOLDER = "TabRecordings";
+const DEFAULT_ANKI_DECK_NAME = "Audio Immersion";
+const DEFAULT_OUTPUT_DIRECTORY = "";
 const DEFAULT_TRANSCRIPTION_SETTINGS = {
   enabled: false,
   whisperCliPath: "",
   whisperModelPath: "",
   language: "auto",
+  ankiDeckName: DEFAULT_ANKI_DECK_NAME,
+};
+const DEFAULT_TRANSLATION_SETTINGS = {
+  enabled: false,
 };
 const DEFAULT_ANKI_QUEUE_STATE = {
   pendingCount: 0,
@@ -41,9 +47,11 @@ async function ensureSettings() {
   const data = await chrome.storage.local.get([
     "format",
     "downloadFolder",
+    "outputDirectory",
     "count",
     "recorderState",
     "transcriptionSettings",
+    "translationSettings",
     "ankiQueueState",
   ]);
 
@@ -57,6 +65,10 @@ async function ensureSettings() {
     updates.downloadFolder = DEFAULT_DOWNLOAD_FOLDER;
   }
 
+  if (typeof data.outputDirectory !== "string") {
+    updates.outputDirectory = DEFAULT_OUTPUT_DIRECTORY;
+  }
+
   if (typeof data.count !== "number") {
     updates.count = 1;
   }
@@ -67,6 +79,10 @@ async function ensureSettings() {
 
   if (!data.ankiQueueState) {
     updates.ankiQueueState = DEFAULT_ANKI_QUEUE_STATE;
+  }
+
+  if (!data.translationSettings) {
+    updates.translationSettings = DEFAULT_TRANSLATION_SETTINGS;
   }
 
   const normalizedTranscriptionSettings =
@@ -121,6 +137,17 @@ async function setDownloadFolder(folder) {
   return nextFolder;
 }
 
+async function getOutputDirectory() {
+  const data = await chrome.storage.local.get("outputDirectory");
+  return sanitizeLocalPath(data.outputDirectory);
+}
+
+async function setOutputDirectory(directory) {
+  const nextDirectory = sanitizeLocalPath(directory);
+  await chrome.storage.local.set({ outputDirectory: nextDirectory });
+  return nextDirectory;
+}
+
 async function getNextFilename(ext, requestedName) {
   const data = await chrome.storage.local.get(["count", "downloadFolder"]);
   const count = typeof data.count === "number" ? data.count : 1;
@@ -158,12 +185,35 @@ async function updateTranscriptionSettings(partialSettings) {
   return nextSettings;
 }
 
+async function getTranslationSettings() {
+  const data = await chrome.storage.local.get("translationSettings");
+  return normalizeTranslationSettings(data.translationSettings);
+}
+
+async function updateTranslationSettings(partialSettings) {
+  const currentSettings = await getTranslationSettings();
+  const nextSettings = normalizeTranslationSettings({
+    ...currentSettings,
+    ...(partialSettings || {}),
+  });
+
+  await chrome.storage.local.set({ translationSettings: nextSettings });
+  return nextSettings;
+}
+
 function normalizeTranscriptionSettings(settings) {
   return {
     enabled: Boolean(settings?.enabled),
     whisperCliPath: sanitizeLocalPath(settings?.whisperCliPath),
     whisperModelPath: sanitizeLocalPath(settings?.whisperModelPath),
     language: sanitizeLanguage(settings?.language),
+    ankiDeckName: sanitizeAnkiDeckName(settings?.ankiDeckName),
+  };
+}
+
+function normalizeTranslationSettings(settings) {
+  return {
+    enabled: Boolean(settings?.enabled),
   };
 }
 
@@ -192,6 +242,11 @@ function sanitizeLanguage(language) {
 
 function sanitizeLocalPath(path) {
   return String(path || "").trim();
+}
+
+function sanitizeAnkiDeckName(deckName) {
+  const normalized = String(deckName || "").trim();
+  return normalized || DEFAULT_ANKI_DECK_NAME;
 }
 
 function sanitizeRecordingName(name) {
@@ -279,6 +334,12 @@ function getFileStem(filePath) {
   const normalized = String(filePath || "").replace(/\\/g, "/");
   const segments = normalized.split("/");
   return stripFileExtension(segments[segments.length - 1] || "recording");
+}
+
+function getFilenameFromPath(filePath) {
+  const normalized = String(filePath || "").replace(/\\/g, "/");
+  const segments = normalized.split("/");
+  return segments[segments.length - 1] || "";
 }
 
 function buildTemporaryWavFilename(primaryRelativeFilename) {
