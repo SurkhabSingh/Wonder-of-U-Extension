@@ -439,7 +439,21 @@ async function blobToDataUrl(blob) {
     binary += String.fromCharCode(...chunk);
   }
 
-  return `data:${blob.type || "application/octet-stream"};base64,${btoa(binary)}`;
+  return `data:${getDataUrlMimeType(blob.type)};base64,${btoa(binary)}`;
+}
+
+function getDataUrlMimeType(mimeType) {
+  const normalized = String(mimeType || "").trim();
+  if (!normalized) {
+    return "application/octet-stream";
+  }
+
+  const baseType = normalized.split(";")[0].trim().toLowerCase();
+  if (/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(baseType)) {
+    return baseType;
+  }
+
+  return "application/octet-stream";
 }
 
 async function convertToMP3(blob) {

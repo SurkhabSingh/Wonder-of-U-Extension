@@ -1,4 +1,9 @@
-importScripts("utils.js");
+importScripts(
+  "utils.js",
+  "capture/browser-tab-capture-provider.js",
+  "translation/google-translate-provider.js",
+  "translation/translation-service.js",
+);
 
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const NATIVE_TRANSCRIBER_HOST = "com.audio_recorder.whisper_host";
@@ -6,10 +11,6 @@ const ANKI_CONNECT_URL = "http://127.0.0.1:8765";
 const ANKI_MODEL_NAME = "Basic";
 const ANKI_FRONT_FIELD = "Front";
 const ANKI_BACK_FIELD = "Back";
-const GOOGLE_TRANSLATE_URL = "https://translate.google.com/";
-const GOOGLE_TRANSLATE_HOST_PERMISSION = "https://translate.google.com/*";
-const GOOGLE_TRANSLATE_TIMEOUT_MS = 20000;
-
 let offscreenCreationPromise = null;
 
 initializeExtension().catch((error) => {
@@ -54,7 +55,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.action === "FLUSH_QUEUE" ||
     message?.action === "GET_QUEUE_STATUS" ||
     message?.action === "GET_QUEUE_ITEMS" ||
-    message?.action === "DROP_QUEUE_ITEM"
+    message?.action === "DROP_QUEUE_ITEM" ||
+    message?.action === "START_AV_TEST"
   ) {
     handleControlMessage(message)
       .then((response) => sendResponse(response))
@@ -116,6 +118,14 @@ async function handleControlMessage(message) {
       cancelled: !selectedPath,
       path: selectedPath || "",
     };
+  }
+
+  if (message.action === "START_AV_TEST") {
+    return startAvCaptureTest({
+      tabId: message.tabId,
+      videoBitsPerSecond: message.videoBitsPerSecond,
+      audioBitsPerSecond: message.audioBitsPerSecond,
+    });
   }
 
   if (message.action === "GET_QUEUE_STATUS") {
@@ -219,17 +229,12 @@ async function startRecording(tabId) {
     errorText: "",
   });
 
-  await ensureOffscreenDocument();
-
-  const streamId = await chrome.tabCapture.getMediaStreamId({
+  await BrowserTabCaptureProvider.startAudioCapture({
     targetTabId,
-  });
-
-  await sendOffscreenMessage({
-    type: "start-recording",
-    streamId,
     format: await getFormat(),
     transcriptionEnabled: transcriptionSettings.enabled,
+    prepare: ensureOffscreenDocument,
+    send: sendOffscreenMessage,
   });
 }
 
@@ -252,9 +257,109 @@ async function stopRecording() {
     errorText: "",
   });
 
-  await sendOffscreenMessage({
-    type: "stop-recording",
+  await BrowserTabCaptureProvider.stopCapture({
+    send: sendOffscreenMessage,
   });
+}
+
+async function startAvCaptureTest(options = {}) {
+  const recorderState = await getRecorderState();
+  if (recorderState.isRecording || recorderState.isProcessing) {
+    throw new Error("A recording or processing job is already active.");
+  }
+
+  const targetTabId = options.tabId || (await getActiveTabId());
+  if (!targetTabId) {
+    throw new Error("No active tab is available to test.");
+  }
+
+  await setRecorderState({
+    isRecording: false,
+    isProcessing: true,
+    startedAt: null,
+    stoppedAt: null,
+    targetTabId,
+    lastDurationMs: 5000,
+    lastAudioPath: null,
+    lastTranscriptPath: null,
+    statusText: "Recording A/V capture test...",
+    errorText: "",
+  });
+
+  let blobId = null;
+
+  try {
+    const captureResult = await BrowserTabCaptureProvider.recordAvSample({
+      targetTabId,
+      durationMs: 5000,
+      videoBitsPerSecond: options.videoBitsPerSecond,
+      audioBitsPerSecond: options.audioBitsPerSecond,
+      prepare: ensureOffscreenDocument,
+      send: sendOffscreenMessage,
+    });
+
+    if (!captureResult?.ok || !captureResult.blobId) {
+      throw new Error(
+        captureResult?.error ||
+          "The offscreen A/V test did not produce a recording.",
+      );
+    }
+
+    blobId = captureResult.blobId;
+    const blob = await getRecordingBlob(blobId);
+    if (!blob) {
+      throw new Error("The A/V test recording data could not be loaded.");
+    }
+
+    const download = await downloadBlobAndWait(blob, buildAvTestFilename());
+    await deleteRecordingBlob(blobId);
+    blobId = null;
+
+    await setRecorderState({
+      isRecording: false,
+      isProcessing: false,
+      startedAt: null,
+      stoppedAt: Date.now(),
+      targetTabId: null,
+      lastDurationMs: captureResult.durationMs || 5000,
+      lastAudioPath: download.filename,
+      lastTranscriptPath: null,
+      statusText: `A/V capture test saved to ${download.filename}`,
+      errorText: "",
+    });
+
+    return {
+      ok: true,
+      filename: download.filename,
+      mimeType: captureResult.mimeType,
+      sizeBytes: captureResult.sizeBytes,
+      durationMs: captureResult.durationMs,
+      actualVideoBitsPerSecond: captureResult.actualVideoBitsPerSecond,
+      actualAudioBitsPerSecond: captureResult.actualAudioBitsPerSecond,
+      trackSettings: captureResult.trackSettings || [],
+    };
+  } catch (error) {
+    await setRecorderState({
+      isRecording: false,
+      isProcessing: false,
+      startedAt: null,
+      stoppedAt: Date.now(),
+      targetTabId: null,
+      lastDurationMs: 0,
+      statusText: "A/V capture test failed",
+      errorText: error.message || "The A/V capture test failed.",
+    });
+
+    throw error;
+  } finally {
+    if (blobId) {
+      await deleteRecordingBlob(blobId);
+    }
+
+    await closeOffscreenDocument().catch((error) => {
+      console.warn("Could not close offscreen document after A/V test:", error);
+    });
+  }
 }
 
 async function handleRecordingStarted(startedAt) {
@@ -397,7 +502,8 @@ async function handleRecordingComplete(message) {
           errorText: "",
         });
 
-        const translationResult = await captureGoogleTranslateTranslation(
+        const translationResult = await TranslationService.capture(
+          "google-translate",
           transcriptText,
         );
         translatedText = translationResult.translatedText;
@@ -741,6 +847,11 @@ async function getDownloadItem(downloadId) {
   return items[0] || null;
 }
 
+function buildAvTestFilename() {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${DEFAULT_DOWNLOAD_FOLDER}/av_test_${timestamp}.webm`;
+}
+
 async function cleanupTemporaryDownload(downloadId) {
   if (!downloadId) {
     return;
@@ -1048,405 +1159,6 @@ function isMissingReceiverError(error) {
   return String(error?.message || error || "").includes(
     "Receiving end does not exist",
   );
-}
-
-async function captureGoogleTranslateTranslation(transcriptText) {
-  const normalizedTranscript = String(transcriptText || "").trim();
-
-  if (!normalizedTranscript) {
-    return {
-      translatedText: "",
-      errorText: "The transcript was empty.",
-    };
-  }
-
-  const hasPermission = await chrome.permissions.contains({
-    origins: [GOOGLE_TRANSLATE_HOST_PERMISSION],
-  });
-
-  if (!hasPermission) {
-    return {
-      translatedText: "",
-      errorText: "Google Translate permission is missing.",
-    };
-  }
-
-  try {
-    const tab = await getOrCreateGoogleTranslateTab();
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: async (sourceText, timeoutMs) => {
-        const stableWindowMs = 1200;
-
-        function normalizeText(value) {
-          return String(value || "")
-            .replace(/\r\n/g, "\n")
-            .replace(/\r/g, "\n")
-            .replace(/\u00a0/g, " ")
-            .replace(/[ \t]+\n/g, "\n")
-            .replace(/\n{3,}/g, "\n\n")
-            .trim();
-        }
-
-        function stripStarBorder(value) {
-          return normalizeText(
-            String(value || "").replace(/\bstar_border\b/gi, " "),
-          );
-        }
-
-        function isVisible(element) {
-          if (!element) {
-            return false;
-          }
-
-          const rect = element.getBoundingClientRect();
-          const style = window.getComputedStyle(element);
-          return (
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.display !== "none" &&
-            style.visibility !== "hidden" &&
-            style.opacity !== "0"
-          );
-        }
-
-        function isEditable(element) {
-          if (!element) {
-            return false;
-          }
-
-          return (
-            element instanceof HTMLTextAreaElement ||
-            element instanceof HTMLInputElement ||
-            element.isContentEditable ||
-            element.getAttribute("role") === "textbox"
-          );
-        }
-
-        function getInputCandidates() {
-          return Array.from(
-            document.querySelectorAll(
-              "textarea, input[type='text'], [contenteditable='true'], [role='textbox']",
-            ),
-          )
-            .filter((element) => isEditable(element) && isVisible(element))
-            .map((element) => {
-              const rect = element.getBoundingClientRect();
-              const label = String(
-                element.getAttribute("aria-label") ||
-                  element.getAttribute("data-placeholder") ||
-                  element.getAttribute("placeholder") ||
-                  "",
-              ).toLowerCase();
-              let score = 0;
-
-              if (rect.left < window.innerWidth * 0.6) {
-                score += 40;
-              }
-
-              if (rect.width >= 120) {
-                score += 20;
-              }
-
-              if (rect.height >= 32) {
-                score += 15;
-              }
-
-              if (
-                label.includes("source") ||
-                label.includes("translate") ||
-                label.includes("text")
-              ) {
-                score += 30;
-              }
-
-              return {
-                element,
-                score,
-              };
-            })
-            .sort((left, right) => right.score - left.score);
-        }
-
-        async function waitForInputElement() {
-          const deadline = Date.now() + timeoutMs;
-
-          while (Date.now() < deadline) {
-            const candidate = getInputCandidates()[0];
-            if (candidate?.element) {
-              return candidate.element;
-            }
-
-            await new Promise((resolve) => {
-              window.setTimeout(resolve, 150);
-            });
-          }
-
-          throw new Error("Google Translate input field was not found in time.");
-        }
-
-        function setInputText(element, value) {
-          const text = String(value || "");
-          element.focus();
-
-          if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-            const prototype =
-              element instanceof HTMLTextAreaElement
-                ? HTMLTextAreaElement.prototype
-                : HTMLInputElement.prototype;
-            const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
-            if (descriptor?.set) {
-              descriptor.set.call(element, text);
-            } else {
-              element.value = text;
-            }
-          } else if (element.isContentEditable || element.getAttribute("role") === "textbox") {
-            const selection = window.getSelection();
-            const range = document.createRange();
-            range.selectNodeContents(element);
-            selection.removeAllRanges();
-            selection.addRange(range);
-            if (!document.execCommand("insertText", false, text)) {
-              element.textContent = text;
-            }
-          }
-
-          element.dispatchEvent(
-            new InputEvent("input", {
-              bubbles: true,
-              data: text,
-              inputType: "insertText",
-            }),
-          );
-          element.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-
-        function wait(ms) {
-          return new Promise((resolve) => {
-            window.setTimeout(resolve, ms);
-          });
-        }
-
-        function getTranslatedTextFromSendFeedbackAnchor() {
-          const target = Array.from(document.querySelectorAll("span")).find(
-            (element) =>
-              isVisible(element) &&
-              String(element.textContent || "").trim() === "Send feedback",
-          );
-          const outerSpan = target?.closest("span");
-          const prevDiv = outerSpan?.previousElementSibling;
-          const copyDiv = prevDiv?.querySelector('div[jsaction^="copy:"]');
-          const text = stripStarBorder(copyDiv?.innerText || copyDiv?.textContent || "");
-
-          return {
-            copyDiv,
-            text,
-          };
-        }
-
-        const inputElement = await waitForInputElement();
-        const normalizedSource = normalizeText(sourceText);
-        const baselineText = getTranslatedTextFromSendFeedbackAnchor().text;
-
-        setInputText(inputElement, "");
-        await wait(150);
-        setInputText(inputElement, normalizedSource);
-
-        return new Promise((resolve, reject) => {
-          const startedAt = Date.now();
-          let lastText = "";
-          let lastChangedAt = Date.now();
-          let sawEmptyOutput = false;
-          let sawNewTranslationText = false;
-          let settled = false;
-          let activeCopyNode = null;
-          let timeoutTimer = 0;
-          let copyObserver = null;
-          let rootObserver = null;
-
-          function cleanup() {
-            if (copyObserver) {
-              copyObserver.disconnect();
-            }
-            if (rootObserver) {
-              rootObserver.disconnect();
-            }
-            window.clearTimeout(timeoutTimer);
-          }
-
-          function finish(result) {
-            if (settled) {
-              return;
-            }
-
-            settled = true;
-            cleanup();
-            resolve(result);
-          }
-
-          function fail(message) {
-            if (settled) {
-              return;
-            }
-
-            settled = true;
-            cleanup();
-            reject(new Error(message));
-          }
-
-          function bindCopyObserver() {
-            const currentState = getTranslatedTextFromSendFeedbackAnchor();
-
-            if (!currentState.copyDiv || currentState.copyDiv === activeCopyNode) {
-              return currentState;
-            }
-
-            if (copyObserver) {
-              copyObserver.disconnect();
-            }
-
-            activeCopyNode = currentState.copyDiv;
-            copyObserver = new MutationObserver(() => {
-              sample();
-            });
-            copyObserver.observe(activeCopyNode, {
-              childList: true,
-              subtree: true,
-              characterData: true,
-            });
-
-            return currentState;
-          }
-
-          function sample() {
-            const currentState = bindCopyObserver();
-            const currentText = currentState.text;
-
-            if (!currentText) {
-              sawEmptyOutput = true;
-              return;
-            }
-
-            if (!sawNewTranslationText && currentText !== baselineText) {
-              sawNewTranslationText = true;
-            }
-
-            if (!sawNewTranslationText && !sawEmptyOutput) {
-              return;
-            }
-
-            if (currentText !== lastText) {
-              lastText = currentText;
-              lastChangedAt = Date.now();
-              return;
-            }
-
-            if (Date.now() - lastChangedAt >= stableWindowMs) {
-              finish(currentText);
-            }
-          }
-
-          rootObserver = new MutationObserver(() => {
-            sample();
-          });
-          rootObserver.observe(document.body, {
-            childList: true,
-            subtree: true,
-            characterData: true,
-          });
-
-          timeoutTimer = window.setTimeout(() => {
-            const currentState = getTranslatedTextFromSendFeedbackAnchor();
-            const currentText = currentState.text;
-            if (currentText) {
-              if (currentText !== baselineText || sawEmptyOutput || !baselineText) {
-                finish(currentText);
-                return;
-              }
-            }
-
-            const currentInputText =
-              inputElement instanceof HTMLTextAreaElement ||
-              inputElement instanceof HTMLInputElement
-                ? normalizeText(inputElement.value)
-                : normalizeText(
-                    inputElement.innerText || inputElement.textContent || "",
-                  );
-
-            if (!currentInputText) {
-              fail("Google Translate input was blank.");
-              return;
-            }
-
-            fail("Google Translate has not produced a fresh translated text yet.");
-          }, timeoutMs);
-
-          sample();
-        });
-      },
-      args: [normalizedTranscript, GOOGLE_TRANSLATE_TIMEOUT_MS],
-    });
-
-    return {
-      translatedText: String(result || "").trim(),
-      errorText: "",
-    };
-  } catch (error) {
-    return {
-      translatedText: "",
-      errorText:
-        error.message || "Google Translate could not be read for this transcript.",
-    };
-  }
-}
-
-async function getOrCreateGoogleTranslateTab() {
-  const [existingTab] = await chrome.tabs.query({
-    url: [GOOGLE_TRANSLATE_HOST_PERMISSION],
-  });
-
-  if (existingTab?.id) {
-    await waitForTabComplete(existingTab.id);
-    return existingTab;
-  }
-
-  const createdTab = await chrome.tabs.create({
-    url: GOOGLE_TRANSLATE_URL,
-    active: false,
-  });
-
-  await waitForTabComplete(createdTab.id);
-  return createdTab;
-}
-
-async function waitForTabComplete(tabId) {
-  if (!tabId) {
-    throw new Error("Google Translate tab could not be created.");
-  }
-
-  const currentTab = await chrome.tabs.get(tabId);
-  if (currentTab.status === "complete") {
-    return;
-  }
-
-  return new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error("Google Translate did not finish loading in time."));
-    }, 15000);
-
-    const listener = (updatedTabId, changeInfo) => {
-      if (updatedTabId !== tabId || changeInfo.status !== "complete") {
-        return;
-      }
-
-      clearTimeout(timeoutId);
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
-    };
-
-    chrome.tabs.onUpdated.addListener(listener);
-  });
 }
 
 function buildTranslationStatusSuffix(options = {}) {

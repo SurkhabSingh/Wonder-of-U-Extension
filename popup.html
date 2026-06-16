@@ -410,6 +410,38 @@
       </section>
 
       <section class="section">
+        <p class="section-title">A/V Capture Test</p>
+
+        <div class="field">
+          <label for="avTestVideoBitrate">Video bitrate</label>
+          <select id="avTestVideoBitrate">
+            <option value="8000000">8 Mbps</option>
+            <option value="12000000" selected>12 Mbps</option>
+            <option value="16000000">16 Mbps</option>
+            <option value="24000000">24 Mbps</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="avTestAudioBitrate">Audio bitrate</label>
+          <select id="avTestAudioBitrate">
+            <option value="192000">192 kbps</option>
+            <option value="256000">256 kbps</option>
+            <option value="320000" selected>320 kbps</option>
+            <option value="510000">510 kbps</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <button id="startAvTest" type="button">Record current tab 5s</button>
+        </div>
+
+        <p id="avTestStatus" class="hint">
+          Temporary tester for same-stream tab audio and video capture.
+        </p>
+      </section>
+
+      <section class="section">
         <p class="section-title">Transcription</p>
 
         <div class="field">

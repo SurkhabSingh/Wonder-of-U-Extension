@@ -7,6 +7,10 @@ const formatSelect = document.getElementById("format");
 const outputDirectoryInput = document.getElementById("outputDirectory");
 const browseOutputDirectoryBtn = document.getElementById("browseOutputDirectory");
 const pathHint = document.getElementById("pathHint");
+const avTestVideoBitrateSelect = document.getElementById("avTestVideoBitrate");
+const avTestAudioBitrateSelect = document.getElementById("avTestAudioBitrate");
+const startAvTestBtn = document.getElementById("startAvTest");
+const avTestStatus = document.getElementById("avTestStatus");
 const transcriptionEnabledInput = document.getElementById("transcriptionEnabled");
 const whisperCliPathInput = document.getElementById("whisperCliPath");
 const whisperModelPathInput = document.getElementById("whisperModelPath");
@@ -33,6 +37,7 @@ let whisperModelPathPersistTimer = null;
 let whisperLanguagePersistTimer = null;
 let ankiDeckNamePersistTimer = null;
 let outputDirectoryPersistTimer = null;
+let avTestRunning = false;
 
 initializePopup().catch((error) => {
   renderStatus("Unable to load popup settings.", "error");
@@ -129,6 +134,10 @@ formatSelect.addEventListener("change", async () => {
 
 browseOutputDirectoryBtn.addEventListener("click", async () => {
   await handleDirectoryBrowse();
+});
+
+startAvTestBtn.addEventListener("click", async () => {
+  await handleAvCaptureTest();
 });
 
 outputDirectoryInput.addEventListener("change", async () => {
@@ -373,6 +382,45 @@ async function handlePathBrowse(kind, input, button) {
   }
 }
 
+async function handleAvCaptureTest() {
+  avTestRunning = true;
+  startAvTestBtn.disabled = true;
+  startAvTestBtn.textContent = "Recording...";
+  renderAvTestStatus("Recording current tab audio and video for 5 seconds.", "");
+
+  try {
+    const [activeTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+
+    const response = await chrome.runtime.sendMessage({
+      action: "START_AV_TEST",
+      tabId: activeTab?.id,
+      videoBitsPerSecond: Number(avTestVideoBitrateSelect.value),
+      audioBitsPerSecond: Number(avTestAudioBitrateSelect.value),
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "The A/V capture test failed.");
+    }
+
+    renderAvTestStatus(
+      `Saved ${response.filename || "A/V test recording"}. Actual bitrate: video ${formatBitrate(response.actualVideoBitsPerSecond)}, audio ${formatBitrate(response.actualAudioBitsPerSecond)}.`,
+      "",
+    );
+  } catch (error) {
+    renderAvTestStatus(
+      error.message || "The A/V capture test failed.",
+      "error",
+    );
+  } finally {
+    avTestRunning = false;
+    startAvTestBtn.textContent = "Record current tab 5s";
+    renderButtons();
+  }
+}
+
 function schedulePersistedSetting(key, value) {
   const timerKey = getPersistTimerKey(key);
   const existingTimer = getPersistTimer(timerKey);
@@ -523,6 +571,26 @@ function renderPill(variant) {
 function renderButtons() {
   startBtn.disabled = currentState.isRecording || currentState.isProcessing;
   stopBtn.disabled = !currentState.isRecording;
+  startAvTestBtn.disabled =
+    avTestRunning || currentState.isRecording || currentState.isProcessing;
+}
+
+function renderAvTestStatus(text, variant) {
+  avTestStatus.textContent = text;
+  avTestStatus.className = `hint${variant === "error" ? " error" : ""}`;
+}
+
+function formatBitrate(value) {
+  const bitrate = Number(value || 0);
+  if (!bitrate) {
+    return "unknown";
+  }
+
+  if (bitrate >= 1000000) {
+    return `${(bitrate / 1000000).toFixed(1)} Mbps`;
+  }
+
+  return `${Math.round(bitrate / 1000)} kbps`;
 }
 
 function renderQueueState() {

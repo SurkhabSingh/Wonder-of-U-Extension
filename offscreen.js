@@ -17,7 +17,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     .then((response) => sendResponse(response))
     .catch(async (error) => {
       console.error("Offscreen handling failed:", error);
-      await reportRecordingError(error);
+      if (
+        message?.type === "start-recording" ||
+        message?.type === "stop-recording"
+      ) {
+        await reportRecordingError(error);
+      }
       sendResponse({
         ok: false,
         error: error.message || "Unexpected offscreen error.",
@@ -44,6 +49,10 @@ async function handleOffscreenMessage(message) {
   if (message.type === "stop-recording") {
     await stopRecording();
     return { ok: true };
+  }
+
+  if (message.type === "record-av-test") {
+    return runAvCaptureTest(message);
   }
 
   return { ok: false, error: "Unknown offscreen command." };
@@ -195,6 +204,151 @@ async function cleanup() {
   chunks = [];
   recordingStartedAt = null;
   transcriptionRequested = false;
+}
+
+async function runAvCaptureTest(message) {
+  if (mediaRecorder?.state === "recording") {
+    throw new Error("The main recorder is already active.");
+  }
+
+  if (!message.streamId) {
+    throw new Error("No tab stream ID was provided for the A/V test.");
+  }
+
+  const durationMs = sanitizeTestDuration(message.durationMs);
+  const mimeType = selectVideoMimeType(message.mimeType);
+  const chunks = [];
+  let testStream = null;
+  let testMonitorContext = null;
+  let testMonitorSource = null;
+  let testRecorder = null;
+  let startedAt = 0;
+
+  try {
+    testStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: "tab",
+          chromeMediaSourceId: message.streamId,
+        },
+      },
+      video: {
+        mandatory: {
+          chromeMediaSource: "tab",
+          chromeMediaSourceId: message.streamId,
+        },
+      },
+    });
+
+    testMonitorContext = new AudioContext();
+    await testMonitorContext.resume();
+    testMonitorSource = testMonitorContext.createMediaStreamSource(testStream);
+    testMonitorSource.connect(testMonitorContext.destination);
+
+    testRecorder = new MediaRecorder(testStream, {
+      mimeType,
+      videoBitsPerSecond: sanitizeTestBitrate(
+        message.videoBitsPerSecond,
+        12000000,
+      ),
+      audioBitsPerSecond: sanitizeTestBitrate(
+        message.audioBitsPerSecond,
+        320000,
+      ),
+    });
+
+    testRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        chunks.push(event.data);
+      }
+    };
+
+    startedAt = Date.now();
+
+    await new Promise((resolve, reject) => {
+      testRecorder.onerror = (event) => {
+        reject(
+          event.error || new Error("MediaRecorder failed during A/V test."),
+        );
+      };
+
+      testRecorder.onstop = resolve;
+      testRecorder.start(1000);
+
+      setTimeout(() => {
+        if (testRecorder?.state === "recording") {
+          testRecorder.stop();
+        }
+      }, durationMs);
+    });
+
+    const blob = new Blob(chunks, {
+      type: testRecorder.mimeType || mimeType,
+    });
+
+    if (!blob.size) {
+      throw new Error("The A/V test did not capture any media data.");
+    }
+
+    const blobId = await saveRecordingBlob(blob);
+
+    return {
+      ok: true,
+      blobId,
+      extension: "webm",
+      mimeType: blob.type || mimeType,
+      sizeBytes: blob.size,
+      durationMs: Date.now() - startedAt,
+      actualVideoBitsPerSecond: testRecorder.videoBitsPerSecond,
+      actualAudioBitsPerSecond: testRecorder.audioBitsPerSecond,
+      trackSettings: testStream.getTracks().map((track) => ({
+        kind: track.kind,
+        label: track.label,
+        settings:
+          typeof track.getSettings === "function" ? track.getSettings() : {},
+      })),
+    };
+  } finally {
+    if (testStream) {
+      testStream.getTracks().forEach((track) => track.stop());
+    }
+
+    if (testMonitorSource) {
+      testMonitorSource.disconnect();
+    }
+
+    if (testMonitorContext && testMonitorContext.state !== "closed") {
+      await testMonitorContext.close();
+    }
+  }
+}
+
+function selectVideoMimeType(requestedMimeType) {
+  const candidates = [
+    requestedMimeType,
+    "video/webm;codecs=vp8,opus",
+    "video/webm;codecs=vp9,opus",
+    "video/webm",
+  ].filter(Boolean);
+
+  return (
+    candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) ||
+    "video/webm"
+  );
+}
+
+function sanitizeTestDuration(value) {
+  const durationMs = Number(value);
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    return 5000;
+  }
+
+  return Math.min(Math.max(durationMs, 1000), 30000);
+}
+
+function sanitizeTestBitrate(value, fallback) {
+  const bitrate = Number(value);
+  return Number.isFinite(bitrate) && bitrate > 0 ? bitrate : fallback;
 }
 
 async function reportRecordingError(error) {
