@@ -11,7 +11,11 @@ const DEFAULT_TRANSCRIPTION_SETTINGS = {
 };
 const DEFAULT_APP_MODE = "unset";
 const APP_MODES = ["unset", "solo", "app-support"];
-const DEFAULT_BRIDGE_ENDPOINT = "http://127.0.0.1:8766";
+// Must stay clear of Anki: 8765 is AnkiConnect and 8766 is the Wonder of U
+// furigana add-on. The bridge originally shipped on 8766, so any endpoint still
+// pointing there is migrated below rather than left to 404 against Anki.
+const DEFAULT_BRIDGE_ENDPOINT = "http://127.0.0.1:8791";
+const LEGACY_BRIDGE_ENDPOINT_PORTS = ["8766"];
 const KNOWN_TRANSLATION_PROVIDERS = [
   {
     id: "google-translate",
@@ -390,6 +394,11 @@ function sanitizeBridgeEndpoint(endpoint) {
   const isLoopback =
     parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
   if (parsed.protocol !== "http:" || !isLoopback) {
+    return DEFAULT_BRIDGE_ENDPOINT;
+  }
+
+  // An endpoint saved before the port move points at Anki, not at the bridge.
+  if (LEGACY_BRIDGE_ENDPOINT_PORTS.includes(parsed.port)) {
     return DEFAULT_BRIDGE_ENDPOINT;
   }
 

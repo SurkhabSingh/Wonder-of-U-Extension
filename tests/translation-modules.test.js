@@ -10,6 +10,10 @@ const context = vm.createContext({
   console,
   clearTimeout,
   setTimeout,
+  // utils.js parses endpoints with `new URL(...)`; without it here every parse
+  // throws and sanitizeBridgeEndpoint silently returns its default, which would
+  // make the endpoint assertions below pass for the wrong reason.
+  URL,
   chrome: {
     permissions: {
       contains: async () => false,
@@ -20,6 +24,7 @@ const context = vm.createContext({
 context.self = context;
 
 for (const relativePath of [
+  "utils.js",
   "translation/provider-automation.js",
   "translation/google-translate-provider.js",
   "translation/deepl-translate-provider.js",
@@ -69,6 +74,33 @@ async function run() {
   assert.equal(
     context.DeepLTranslateProvider.config.url,
     "https://www.deepl.com/en/translator",
+  );
+
+  // utils.js exposes these as top-level `const`s, which are lexical bindings in
+  // the context rather than properties on it, so they have to be read by
+  // evaluating inside the context.
+  const evaluate = (expression) => vm.runInContext(expression, context);
+
+  // The bridge must not sit on a port Anki already owns: 8765 is AnkiConnect and
+  // 8766 is the furigana add-on. Pointing there means the extension long-polls
+  // Anki, which answers /v1/* with 404 and reads as "bridge not connected".
+  assert.equal(evaluate("DEFAULT_BRIDGE_ENDPOINT"), "http://127.0.0.1:8791");
+  assert.equal(
+    evaluate('sanitizeBridgeEndpoint("http://127.0.0.1:8766")'),
+    evaluate("DEFAULT_BRIDGE_ENDPOINT"),
+    "an endpoint saved on Anki's old port must be migrated, not preserved",
+  );
+  assert.equal(
+    evaluate('sanitizeBridgeEndpoint("http://127.0.0.1:9100")'),
+    "http://127.0.0.1:9100",
+    "a deliberate custom endpoint must still be honoured",
+  );
+
+  // The language picker is only useful if it has the app's full list behind it.
+  assert.ok(evaluate("WHISPER_LANGUAGE_OPTIONS.length") > 90);
+  assert.equal(evaluate("WHISPER_LANGUAGE_OPTIONS[0].code"), "auto");
+  assert.ok(
+    evaluate('WHISPER_LANGUAGE_OPTIONS.some((option) => option.code === "ja")'),
   );
 
   const unknownProviderResult = await context.TranslationService.capture(

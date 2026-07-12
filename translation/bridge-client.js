@@ -56,16 +56,31 @@
     }
   }
 
+  // A loopback port can be held by anything — Anki sits on 8765/8766 right next
+  // to us. Confirm whoever answered actually speaks our contract, so a stranger
+  // on the port reads as "not the app" rather than a bare, puzzling HTTP status.
   async function probeHealth() {
     const response = await fetchWithTimeout("/v1/health", { method: "GET" });
     if (!response.ok) {
-      throw new Error(`Bridge host returned status ${response.status}.`);
+      throw new Error(
+        `${endpoint} is in use by another program (status ${response.status}). The Wonder of U app is not listening there.`,
+      );
     }
 
     const payload = await response.json().catch(() => ({}));
+    const protocol = String(payload?.protocol || "");
+
+    if (protocol !== PROTOCOL_VERSION) {
+      throw new Error(
+        protocol
+          ? `${endpoint} speaks bridge protocol ${protocol}, but this extension needs ${PROTOCOL_VERSION}.`
+          : `${endpoint} answered, but it is not a Wonder of U bridge host.`,
+      );
+    }
+
     return {
       version: String(payload?.version || ""),
-      protocol: String(payload?.protocol || ""),
+      protocol,
     };
   }
 
