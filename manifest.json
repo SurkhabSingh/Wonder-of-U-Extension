@@ -16,7 +16,10 @@
     "tabs"
   ],
   "optional_host_permissions": [
-    "https://translate.google.com/*"
+    "https://translate.google.com/*",
+    "https://www.deepl.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
   ],
   "background": {
     "service_worker": "background.js"

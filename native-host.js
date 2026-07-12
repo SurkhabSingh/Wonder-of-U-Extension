@@ -62,6 +62,10 @@ async function handleNativeMessage(message) {
     return pickPath(message);
   }
 
+  if (message?.type === "list-anki-decks") {
+    return listAnkiDecks(message);
+  }
+
   if (message?.type === "queue-anki-card") {
     return queueStandaloneAnkiCard(message);
   }
@@ -941,6 +945,26 @@ function spawnProcess(command, args) {
       );
     });
   });
+}
+
+// The popup cannot call AnkiConnect directly: AnkiConnect rejects requests whose
+// Origin is not in its webCorsOriginList, and a chrome-extension:// origin is not
+// there by default. The native host has no such restriction, so deck listing —
+// like every other Anki call — goes through here.
+async function listAnkiDecks(message) {
+  const anki = normalizeAnkiConfig({ ...message?.anki, enabled: true });
+  const decks = await invokeAnki(anki.connectUrl, "deckNames", {});
+
+  if (!Array.isArray(decks)) {
+    throw new Error("Anki did not return a deck list.");
+  }
+
+  return {
+    decks: decks
+      .map((deck) => String(deck || "").trim())
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right)),
+  };
 }
 
 function invokeAnki(connectUrl, action, params = {}) {

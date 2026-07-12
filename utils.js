@@ -9,8 +9,26 @@ const DEFAULT_TRANSCRIPTION_SETTINGS = {
   language: "auto",
   ankiDeckName: DEFAULT_ANKI_DECK_NAME,
 };
+const DEFAULT_APP_MODE = "unset";
+const APP_MODES = ["unset", "solo", "app-support"];
+const DEFAULT_BRIDGE_ENDPOINT = "http://127.0.0.1:8766";
+const KNOWN_TRANSLATION_PROVIDERS = [
+  {
+    id: "google-translate",
+    label: "Google Translate",
+    hostPermission: "https://translate.google.com/*",
+  },
+  {
+    id: "deepl",
+    label: "DeepL",
+    hostPermission: "https://www.deepl.com/*",
+  },
+];
+const DEFAULT_TRANSLATION_PROVIDER = KNOWN_TRANSLATION_PROVIDERS[0].id;
 const DEFAULT_TRANSLATION_SETTINGS = {
   enabled: false,
+  provider: DEFAULT_TRANSLATION_PROVIDER,
+  bridgeEndpoint: DEFAULT_BRIDGE_ENDPOINT,
 };
 const DEFAULT_ANKI_QUEUE_STATE = {
   pendingCount: 0,
@@ -41,6 +59,113 @@ const WHISPER_LANGUAGE_ALIASES = {
   "\u65e5\u672c\u8a9e": "ja",
 };
 
+// The languages Whisper accepts. Kept in step with the desktop app's
+// LANGUAGE_OPTIONS (desktop-app/src/constants.ts) so both pickers offer the
+// same set.
+const WHISPER_LANGUAGE_OPTIONS = [
+  { code: "auto", label: "Auto detect" },
+  { code: "af", label: "Afrikaans" },
+  { code: "am", label: "Amharic" },
+  { code: "ar", label: "Arabic" },
+  { code: "as", label: "Assamese" },
+  { code: "az", label: "Azerbaijani" },
+  { code: "ba", label: "Bashkir" },
+  { code: "be", label: "Belarusian" },
+  { code: "bg", label: "Bulgarian" },
+  { code: "bn", label: "Bengali" },
+  { code: "bo", label: "Tibetan" },
+  { code: "br", label: "Breton" },
+  { code: "bs", label: "Bosnian" },
+  { code: "ca", label: "Catalan" },
+  { code: "cs", label: "Czech" },
+  { code: "cy", label: "Welsh" },
+  { code: "da", label: "Danish" },
+  { code: "de", label: "German" },
+  { code: "el", label: "Greek" },
+  { code: "en", label: "English" },
+  { code: "es", label: "Spanish" },
+  { code: "et", label: "Estonian" },
+  { code: "eu", label: "Basque" },
+  { code: "fa", label: "Persian" },
+  { code: "fi", label: "Finnish" },
+  { code: "fo", label: "Faroese" },
+  { code: "fr", label: "French" },
+  { code: "gl", label: "Galician" },
+  { code: "gu", label: "Gujarati" },
+  { code: "ha", label: "Hausa" },
+  { code: "haw", label: "Hawaiian" },
+  { code: "he", label: "Hebrew" },
+  { code: "hi", label: "Hindi" },
+  { code: "hr", label: "Croatian" },
+  { code: "ht", label: "Haitian Creole" },
+  { code: "hu", label: "Hungarian" },
+  { code: "hy", label: "Armenian" },
+  { code: "id", label: "Indonesian" },
+  { code: "is", label: "Icelandic" },
+  { code: "it", label: "Italian" },
+  { code: "ja", label: "Japanese" },
+  { code: "jw", label: "Javanese" },
+  { code: "ka", label: "Georgian" },
+  { code: "kk", label: "Kazakh" },
+  { code: "km", label: "Khmer" },
+  { code: "kn", label: "Kannada" },
+  { code: "ko", label: "Korean" },
+  { code: "la", label: "Latin" },
+  { code: "lb", label: "Luxembourgish" },
+  { code: "ln", label: "Lingala" },
+  { code: "lo", label: "Lao" },
+  { code: "lt", label: "Lithuanian" },
+  { code: "lv", label: "Latvian" },
+  { code: "mg", label: "Malagasy" },
+  { code: "mi", label: "Maori" },
+  { code: "mk", label: "Macedonian" },
+  { code: "ml", label: "Malayalam" },
+  { code: "mn", label: "Mongolian" },
+  { code: "mr", label: "Marathi" },
+  { code: "ms", label: "Malay" },
+  { code: "mt", label: "Maltese" },
+  { code: "my", label: "Myanmar" },
+  { code: "ne", label: "Nepali" },
+  { code: "nl", label: "Dutch" },
+  { code: "nn", label: "Nynorsk" },
+  { code: "no", label: "Norwegian" },
+  { code: "oc", label: "Occitan" },
+  { code: "pa", label: "Punjabi" },
+  { code: "pl", label: "Polish" },
+  { code: "ps", label: "Pashto" },
+  { code: "pt", label: "Portuguese" },
+  { code: "ro", label: "Romanian" },
+  { code: "ru", label: "Russian" },
+  { code: "sa", label: "Sanskrit" },
+  { code: "sd", label: "Sindhi" },
+  { code: "si", label: "Sinhala" },
+  { code: "sk", label: "Slovak" },
+  { code: "sl", label: "Slovenian" },
+  { code: "sn", label: "Shona" },
+  { code: "so", label: "Somali" },
+  { code: "sq", label: "Albanian" },
+  { code: "sr", label: "Serbian" },
+  { code: "su", label: "Sundanese" },
+  { code: "sv", label: "Swedish" },
+  { code: "sw", label: "Swahili" },
+  { code: "ta", label: "Tamil" },
+  { code: "te", label: "Telugu" },
+  { code: "tg", label: "Tajik" },
+  { code: "th", label: "Thai" },
+  { code: "tk", label: "Turkmen" },
+  { code: "tl", label: "Tagalog" },
+  { code: "tr", label: "Turkish" },
+  { code: "tt", label: "Tatar" },
+  { code: "uk", label: "Ukrainian" },
+  { code: "ur", label: "Urdu" },
+  { code: "uz", label: "Uzbek" },
+  { code: "vi", label: "Vietnamese" },
+  { code: "yi", label: "Yiddish" },
+  { code: "yo", label: "Yoruba" },
+  { code: "yue", label: "Cantonese" },
+  { code: "zh", label: "Chinese" },
+];
+
 const RECORDING_DB_NAME = "tab-audio-recorder";
 const RECORDING_STORE_NAME = "recordings";
 async function ensureSettings() {
@@ -53,9 +178,14 @@ async function ensureSettings() {
     "transcriptionSettings",
     "translationSettings",
     "ankiQueueState",
+    "appMode",
   ]);
 
   const updates = {};
+
+  if (!APP_MODES.includes(data.appMode)) {
+    updates.appMode = DEFAULT_APP_MODE;
+  }
 
   if (!data.format) {
     updates.format = DEFAULT_FORMAT;
@@ -81,8 +211,16 @@ async function ensureSettings() {
     updates.ankiQueueState = DEFAULT_ANKI_QUEUE_STATE;
   }
 
-  if (!data.translationSettings) {
-    updates.translationSettings = DEFAULT_TRANSLATION_SETTINGS;
+  const normalizedTranslationSettings = normalizeTranslationSettings(
+    data.translationSettings,
+  );
+
+  if (
+    !data.translationSettings ||
+    JSON.stringify(normalizedTranslationSettings) !==
+      JSON.stringify(data.translationSettings)
+  ) {
+    updates.translationSettings = normalizedTranslationSettings;
   }
 
   const normalizedTranscriptionSettings =
@@ -214,7 +352,64 @@ function normalizeTranscriptionSettings(settings) {
 function normalizeTranslationSettings(settings) {
   return {
     enabled: Boolean(settings?.enabled),
+    provider: sanitizeTranslationProvider(settings?.provider),
+    bridgeEndpoint: sanitizeBridgeEndpoint(settings?.bridgeEndpoint),
   };
+}
+
+function sanitizeTranslationProvider(provider) {
+  const normalized = String(provider || "").trim();
+  const isKnown = KNOWN_TRANSLATION_PROVIDERS.some(
+    (entry) => entry.id === normalized,
+  );
+
+  return isKnown ? normalized : DEFAULT_TRANSLATION_PROVIDER;
+}
+
+function getTranslationProvider(providerId) {
+  const normalized = sanitizeTranslationProvider(providerId);
+  return (
+    KNOWN_TRANSLATION_PROVIDERS.find((entry) => entry.id === normalized) ||
+    KNOWN_TRANSLATION_PROVIDERS[0]
+  );
+}
+
+function sanitizeBridgeEndpoint(endpoint) {
+  const normalized = String(endpoint || "").trim();
+  if (!normalized) {
+    return DEFAULT_BRIDGE_ENDPOINT;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch (error) {
+    return DEFAULT_BRIDGE_ENDPOINT;
+  }
+
+  const isLoopback =
+    parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+  if (parsed.protocol !== "http:" || !isLoopback) {
+    return DEFAULT_BRIDGE_ENDPOINT;
+  }
+
+  return `${parsed.protocol}//${parsed.host}`;
+}
+
+function sanitizeAppMode(mode) {
+  const normalized = String(mode || "").trim();
+  return APP_MODES.includes(normalized) ? normalized : DEFAULT_APP_MODE;
+}
+
+async function getAppMode() {
+  const data = await chrome.storage.local.get("appMode");
+  return sanitizeAppMode(data.appMode);
+}
+
+async function setAppMode(mode) {
+  const nextMode = sanitizeAppMode(mode);
+  await chrome.storage.local.set({ appMode: nextMode });
+  return nextMode;
 }
 
 function migrateTranscriptionSettings(settings) {

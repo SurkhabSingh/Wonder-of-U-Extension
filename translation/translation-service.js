@@ -25,11 +25,19 @@
   }
 
   register(globalScope.GoogleTranslateProvider);
+  register(globalScope.DeepLTranslateProvider);
 
   globalScope.TranslationService = Object.freeze({
     capture,
     hasProvider(providerId) {
       return providers.has(providerId);
+    },
+    listProviders() {
+      return Array.from(providers.values()).map((provider) => ({
+        id: provider.id,
+        label: provider.config?.label || provider.id,
+        hostPermission: provider.config?.hostPermission || "",
+      }));
     },
   });
 })(self);

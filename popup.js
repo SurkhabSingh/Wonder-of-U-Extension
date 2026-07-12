@@ -18,13 +18,31 @@ const browseWhisperCliPathBtn = document.getElementById("browseWhisperCliPath");
 const browseWhisperModelPathBtn = document.getElementById("browseWhisperModelPath");
 const whisperLanguageInput = document.getElementById("whisperLanguage");
 const ankiDeckNameInput = document.getElementById("ankiDeckName");
+const ankiDeckNameFallbackInput = document.getElementById("ankiDeckNameFallback");
+const refreshAnkiDecksBtn = document.getElementById("refreshAnkiDecks");
+const ankiDeckHint = document.getElementById("ankiDeckHint");
 const translationEnabledInput = document.getElementById("translationEnabled");
 const transcriptionFields = document.getElementById("transcriptionFields");
 const queueCount = document.getElementById("queueCount");
 const queueStatus = document.getElementById("queueStatus");
 const pushQueueBtn = document.getElementById("pushQueue");
 const queueList = document.getElementById("queueList");
+const subtitle = document.getElementById("subtitle");
+const modeBar = document.getElementById("modeBar");
+const modeName = document.getElementById("modeName");
+const changeModeBtn = document.getElementById("changeModeBtn");
+const modeChooser = document.getElementById("modeChooser");
+const modeError = document.getElementById("modeError");
+const soloView = document.getElementById("soloView");
+const appSupportView = document.getElementById("appSupportView");
+const chooseSoloBtn = document.getElementById("chooseSolo");
+const chooseAppSupportBtn = document.getElementById("chooseAppSupport");
+const translationProviderSelect = document.getElementById("translationProvider");
+const appSupportProviderSelect = document.getElementById("appSupportProvider");
+const bridgeStatus = document.getElementById("bridgeStatus");
 
+let currentAppMode = DEFAULT_APP_MODE;
+let bridgeStatusInterval = null;
 let currentState = DEFAULT_RECORDER_STATE;
 let currentTranscriptionSettings = DEFAULT_TRANSCRIPTION_SETTINGS;
 let currentTranslationSettings = DEFAULT_TRANSLATION_SETTINGS;
@@ -34,10 +52,12 @@ let currentOutputDirectory = DEFAULT_OUTPUT_DIRECTORY;
 let timerInterval = null;
 let whisperCliPathPersistTimer = null;
 let whisperModelPathPersistTimer = null;
-let whisperLanguagePersistTimer = null;
 let ankiDeckNamePersistTimer = null;
 let outputDirectoryPersistTimer = null;
 let avTestRunning = false;
+let ankiDecks = [];
+let ankiDeckError = "";
+let ankiDecksLoading = false;
 
 initializePopup().catch((error) => {
   renderStatus("Unable to load popup settings.", "error");
@@ -191,27 +211,37 @@ whisperLanguageInput.addEventListener("change", async () => {
     language: whisperLanguageInput.value,
   });
 });
-whisperLanguageInput.addEventListener("input", () => {
-  schedulePersistedSetting("language", whisperLanguageInput.value);
-});
 
 ankiDeckNameInput.addEventListener("change", async () => {
   await persistTranscriptionSettings({
     ankiDeckName: ankiDeckNameInput.value,
   });
 });
-ankiDeckNameInput.addEventListener("input", () => {
-  schedulePersistedSetting("ankiDeckName", ankiDeckNameInput.value);
+
+// Shown only when Anki cannot be reached, so the deck name stays editable.
+ankiDeckNameFallbackInput.addEventListener("change", async () => {
+  await persistTranscriptionSettings({
+    ankiDeckName: ankiDeckNameFallbackInput.value,
+  });
+});
+ankiDeckNameFallbackInput.addEventListener("input", () => {
+  schedulePersistedSetting("ankiDeckName", ankiDeckNameFallbackInput.value);
+});
+
+refreshAnkiDecksBtn.addEventListener("click", async () => {
+  await refreshAnkiDecks();
 });
 
 translationEnabledInput.addEventListener("change", async () => {
   if (translationEnabledInput.checked) {
-    const granted = await requestGoogleTranslatePermission();
+    const granted = await requestProviderPermission(
+      currentTranslationSettings.provider,
+    );
 
     if (!granted) {
       translationEnabledInput.checked = false;
       renderStatus(
-        "Google Translate permission was not granted. Translation stayed off.",
+        `${getTranslationProvider(currentTranslationSettings.provider).label} permission was not granted. Translation stayed off.`,
         "error",
       );
       await persistTranslationSettings({ enabled: false });
@@ -222,6 +252,36 @@ translationEnabledInput.addEventListener("change", async () => {
   await persistTranslationSettings({
     enabled: translationEnabledInput.checked,
   });
+});
+
+translationProviderSelect.addEventListener("change", async () => {
+  await handleProviderChange(translationProviderSelect.value);
+});
+
+appSupportProviderSelect.addEventListener("change", async () => {
+  await handleProviderChange(appSupportProviderSelect.value);
+});
+
+chooseSoloBtn.addEventListener("click", async () => {
+  await setMode("solo");
+});
+
+chooseAppSupportBtn.addEventListener("click", async () => {
+  const granted = await requestLoopbackPermission();
+
+  if (!granted) {
+    renderModeError(
+      "Local connection permission is needed for App Support mode.",
+    );
+    return;
+  }
+
+  await requestProviderPermission(currentTranslationSettings.provider);
+  await setMode("app-support");
+});
+
+changeModeBtn.addEventListener("click", async () => {
+  await setMode("unset");
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
@@ -268,12 +328,21 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     };
     renderRecorderState();
   }
+
+  if (changes.appMode) {
+    currentAppMode = sanitizeAppMode(changes.appMode.newValue);
+    renderMode();
+  }
 });
 
 async function initializePopup() {
   await ensureSettings();
 
+  populateProviderSelect(translationProviderSelect);
+  populateProviderSelect(appSupportProviderSelect);
+
   const [
+    appMode,
     format,
     outputDirectory,
     recorderState,
@@ -282,6 +351,7 @@ async function initializePopup() {
     ankiQueueState,
   ] =
     await Promise.all([
+      getAppMode(),
       getFormat(),
       getOutputDirectory(),
       getRecorderState(),
@@ -290,6 +360,7 @@ async function initializePopup() {
       getAnkiQueueState(),
     ]);
 
+  currentAppMode = appMode;
   formatSelect.value = format;
   currentOutputDirectory = outputDirectory;
   renderOutputDirectory();
@@ -303,8 +374,26 @@ async function initializePopup() {
   renderQueueState();
   renderQueueItems();
   renderRecorderState();
-  await refreshQueueState();
-  await refreshQueueItems();
+  renderMode();
+
+  if (currentAppMode === "solo") {
+    await refreshQueueState();
+    await refreshQueueItems();
+    // Not awaited: the deck list needs the native host, and a missing or slow
+    // host should not hold up the rest of the popup.
+    refreshAnkiDecks().catch(() => {});
+  }
+}
+
+function populateProviderSelect(select) {
+  if (!select) {
+    return;
+  }
+
+  select.innerHTML = KNOWN_TRANSLATION_PROVIDERS.map(
+    (provider) =>
+      `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.label)}</option>`,
+  ).join("");
 }
 
 async function persistTranscriptionSettings(partialSettings) {
@@ -449,8 +538,6 @@ function getPersistTimerKey(key) {
       return "whisperCliPathPersistTimer";
     case "whisperModelPath":
       return "whisperModelPathPersistTimer";
-    case "language":
-      return "whisperLanguagePersistTimer";
     case "ankiDeckName":
       return "ankiDeckNamePersistTimer";
     case "outputDirectory":
@@ -466,8 +553,6 @@ function getPersistTimer(timerKey) {
       return whisperCliPathPersistTimer;
     case "whisperModelPathPersistTimer":
       return whisperModelPathPersistTimer;
-    case "whisperLanguagePersistTimer":
-      return whisperLanguagePersistTimer;
     case "ankiDeckNamePersistTimer":
       return ankiDeckNamePersistTimer;
     case "outputDirectoryPersistTimer":
@@ -485,9 +570,6 @@ function setPersistTimer(timerKey, value) {
     case "whisperModelPathPersistTimer":
       whisperModelPathPersistTimer = value;
       break;
-    case "whisperLanguagePersistTimer":
-      whisperLanguagePersistTimer = value;
-      break;
     case "ankiDeckNamePersistTimer":
       ankiDeckNamePersistTimer = value;
       break;
@@ -503,16 +585,260 @@ function renderTranscriptionSettings() {
   transcriptionEnabledInput.checked = currentTranscriptionSettings.enabled;
   whisperCliPathInput.value = currentTranscriptionSettings.whisperCliPath;
   whisperModelPathInput.value = currentTranscriptionSettings.whisperModelPath;
-  whisperLanguageInput.value = currentTranscriptionSettings.language;
-  ankiDeckNameInput.value = currentTranscriptionSettings.ankiDeckName;
+  renderLanguageSelect();
+  renderAnkiDeckField();
   transcriptionFields.classList.toggle(
     "muted-block",
     !currentTranscriptionSettings.enabled
   );
 }
 
+// Rebuilt on every render so a language saved before this dropdown existed (or
+// typed straight into storage) is still selectable rather than silently reset.
+function renderLanguageSelect() {
+  const language = currentTranscriptionSettings.language;
+  const options = WHISPER_LANGUAGE_OPTIONS.map(
+    (option) =>
+      `<option value="${escapeHtml(option.code)}">${escapeHtml(option.label)} (${escapeHtml(option.code)})</option>`,
+  );
+
+  const isKnown = WHISPER_LANGUAGE_OPTIONS.some(
+    (option) => option.code === language,
+  );
+
+  if (!isKnown && language) {
+    options.push(
+      `<option value="${escapeHtml(language)}">Custom (${escapeHtml(language)})</option>`,
+    );
+  }
+
+  whisperLanguageInput.innerHTML = options.join("");
+  whisperLanguageInput.value = language;
+}
+
+function renderAnkiDeckField() {
+  const deckName = currentTranscriptionSettings.ankiDeckName;
+  const hasDecks = ankiDecks.length > 0;
+
+  ankiDeckNameInput.hidden = !hasDecks;
+  refreshAnkiDecksBtn.disabled = ankiDecksLoading;
+  refreshAnkiDecksBtn.textContent = ankiDecksLoading ? "…" : "Refresh";
+  ankiDeckNameFallbackInput.hidden = hasDecks;
+
+  if (hasDecks) {
+    const options = ankiDecks.map(
+      (deck) => `<option value="${escapeHtml(deck)}">${escapeHtml(deck)}</option>`,
+    );
+
+    // Keep a saved deck that Anki no longer has, so opening the popup does not
+    // quietly repoint cards at a different deck.
+    if (deckName && !ankiDecks.includes(deckName)) {
+      options.push(
+        `<option value="${escapeHtml(deckName)}">${escapeHtml(deckName)} (missing in Anki)</option>`,
+      );
+    }
+
+    ankiDeckNameInput.innerHTML = options.join("");
+    ankiDeckNameInput.value = deckName;
+  } else {
+    ankiDeckNameFallbackInput.value = deckName;
+  }
+
+  const hintText = ankiDecksLoading
+    ? "Loading decks from Anki…"
+    : hasDecks
+      ? ""
+      : ankiDeckError ||
+        "Could not reach Anki. Type the deck name, or open Anki and refresh.";
+
+  ankiDeckHint.textContent = hintText;
+  ankiDeckHint.hidden = !hintText;
+  ankiDeckHint.classList.toggle("error", Boolean(ankiDeckError) && !hasDecks);
+}
+
+// Deck names come from the native host: AnkiConnect only accepts requests whose
+// Origin is in its webCorsOriginList, which excludes chrome-extension:// pages.
+async function refreshAnkiDecks() {
+  ankiDecksLoading = true;
+  ankiDeckError = "";
+  renderAnkiDeckField();
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: "LIST_ANKI_DECKS",
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Anki did not return a deck list.");
+    }
+
+    ankiDecks = Array.isArray(response.decks) ? response.decks : [];
+
+    if (!ankiDecks.length) {
+      ankiDeckError = "Anki has no decks yet. Create one, then refresh.";
+    }
+  } catch (error) {
+    ankiDecks = [];
+    ankiDeckError = String(error?.message || error || "").trim();
+  } finally {
+    ankiDecksLoading = false;
+    renderAnkiDeckField();
+  }
+}
+
 function renderTranslationSettings() {
   translationEnabledInput.checked = currentTranslationSettings.enabled;
+
+  if (translationProviderSelect) {
+    translationProviderSelect.value = currentTranslationSettings.provider;
+  }
+  if (appSupportProviderSelect) {
+    appSupportProviderSelect.value = currentTranslationSettings.provider;
+  }
+}
+
+function renderMode() {
+  const isUnset = currentAppMode === "unset";
+  const isSolo = currentAppMode === "solo";
+  const isAppSupport = currentAppMode === "app-support";
+
+  modeChooser.hidden = !isUnset;
+  modeBar.hidden = isUnset;
+  soloView.hidden = !isSolo;
+  appSupportView.hidden = !isAppSupport;
+  statePill.hidden = !isSolo;
+
+  modeName.textContent = isAppSupport ? "App Support" : "Solo";
+  subtitle.textContent = isAppSupport
+    ? "Translation worker for the Wonder of U app and Anki plugin."
+    : isSolo
+      ? "Capture the current tab's audio, save it, and optionally transcribe it locally."
+      : "Pick how you want to use Wonder of U.";
+
+  if (!isUnset) {
+    renderModeError("");
+  }
+
+  syncBridgeStatusPolling(isAppSupport);
+}
+
+function renderModeError(message) {
+  if (!modeError) {
+    return;
+  }
+
+  modeError.textContent = message || "";
+  modeError.hidden = !message;
+}
+
+function syncBridgeStatusPolling(active) {
+  if (bridgeStatusInterval) {
+    clearInterval(bridgeStatusInterval);
+    bridgeStatusInterval = null;
+  }
+
+  if (!active) {
+    return;
+  }
+
+  refreshBridgeStatus();
+  bridgeStatusInterval = window.setInterval(refreshBridgeStatus, 5000);
+}
+
+async function refreshBridgeStatus() {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: "GET_BRIDGE_STATUS",
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Bridge status is unavailable.");
+    }
+
+    renderBridgeStatus(response.status);
+  } catch (error) {
+    renderBridgeStatus({ connected: false, lastError: error.message });
+  }
+}
+
+function renderBridgeStatus(status) {
+  const connected = Boolean(status?.connected);
+
+  if (connected) {
+    bridgeStatus.textContent = status.version
+      ? `Connected · host ${status.version}`
+      : "Connected";
+  } else {
+    bridgeStatus.textContent = status?.lastError
+      ? `Not connected · ${status.lastError}`
+      : "Not connected";
+  }
+
+  bridgeStatus.className = `bridge-status ${connected ? "connected" : "disconnected"}`;
+}
+
+async function setMode(mode) {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: "SET_APP_MODE",
+      appMode: mode,
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Could not change the mode.");
+    }
+
+    currentAppMode = response.appMode;
+    renderMode();
+
+    if (currentAppMode === "solo") {
+      await refreshQueueState();
+      await refreshQueueItems();
+      refreshAnkiDecks().catch(() => {});
+    }
+  } catch (error) {
+    renderModeError(error.message || "Could not change the mode.");
+  }
+}
+
+async function requestLoopbackPermission() {
+  const permissions = {
+    origins: ["http://127.0.0.1/*", "http://localhost/*"],
+  };
+
+  if (await chrome.permissions.contains(permissions)) {
+    return true;
+  }
+
+  return chrome.permissions.request(permissions);
+}
+
+async function requestProviderPermission(providerId) {
+  const provider = getTranslationProvider(providerId);
+  const permissions = {
+    origins: [provider.hostPermission],
+  };
+
+  if (await chrome.permissions.contains(permissions)) {
+    return true;
+  }
+
+  return chrome.permissions.request(permissions);
+}
+
+async function handleProviderChange(providerId) {
+  const granted = await requestProviderPermission(providerId);
+
+  if (!granted) {
+    renderTranslationSettings();
+    renderStatus(
+      `${getTranslationProvider(providerId).label} permission was not granted.`,
+      "error",
+    );
+    return;
+  }
+
+  await persistTranslationSettings({ provider: providerId });
 }
 
 function renderOutputDirectory() {
@@ -734,15 +1060,3 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
-async function requestGoogleTranslatePermission() {
-  const permissions = {
-    origins: ["https://translate.google.com/*"],
-  };
-
-  const hasPermission = await chrome.permissions.contains(permissions);
-  if (hasPermission) {
-    return true;
-  }
-
-  return chrome.permissions.request(permissions);
-}

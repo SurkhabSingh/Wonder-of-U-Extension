@@ -1,12 +1,16 @@
 importScripts(
   "utils.js",
   "capture/browser-tab-capture-provider.js",
+  "translation/provider-automation.js",
   "translation/google-translate-provider.js",
+  "translation/deepl-translate-provider.js",
   "translation/translation-service.js",
+  "translation/bridge-client.js",
 );
 
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const NATIVE_TRANSCRIBER_HOST = "com.audio_recorder.whisper_host";
+const PROVIDER_VISIBILITY_SHIM_ID = "wonder-provider-visibility-shim";
 const ANKI_CONNECT_URL = "http://127.0.0.1:8765";
 const ANKI_MODEL_NAME = "Basic";
 const ANKI_FRONT_FIELD = "Front";
@@ -26,6 +30,18 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.runtime.onInstalled.addListener(() => {
   initializeExtension().catch((error) => {
     console.error("Install initialization failed:", error);
+  });
+});
+
+chrome.permissions.onAdded.addListener(() => {
+  syncProviderVisibilityShim().catch((error) => {
+    console.warn("Could not register the provider visibility shim:", error);
+  });
+});
+
+chrome.permissions.onRemoved.addListener(() => {
+  syncProviderVisibilityShim().catch((error) => {
+    console.warn("Could not update the provider visibility shim:", error);
   });
 });
 
@@ -56,7 +72,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.action === "GET_QUEUE_STATUS" ||
     message?.action === "GET_QUEUE_ITEMS" ||
     message?.action === "DROP_QUEUE_ITEM" ||
-    message?.action === "START_AV_TEST"
+    message?.action === "START_AV_TEST" ||
+    message?.action === "GET_APP_MODE" ||
+    message?.action === "SET_APP_MODE" ||
+    message?.action === "GET_BRIDGE_STATUS" ||
+    message?.action === "LIST_ANKI_DECKS"
   ) {
     handleControlMessage(message)
       .then((response) => sendResponse(response))
@@ -126,6 +146,34 @@ async function handleControlMessage(message) {
       videoBitsPerSecond: message.videoBitsPerSecond,
       audioBitsPerSecond: message.audioBitsPerSecond,
     });
+  }
+
+  if (message.action === "LIST_ANKI_DECKS") {
+    const response = await requestNativeHostMessage({
+      type: "list-anki-decks",
+      anki: { connectUrl: ANKI_CONNECT_URL },
+    });
+
+    return { ok: true, decks: response.decks || [] };
+  }
+
+  if (message.action === "GET_APP_MODE") {
+    const appMode = await getAppMode();
+    return { ok: true, appMode };
+  }
+
+  if (message.action === "SET_APP_MODE") {
+    const appMode = await setAppMode(message.appMode);
+    await syncBridgeClient();
+    return { ok: true, appMode };
+  }
+
+  if (message.action === "GET_BRIDGE_STATUS") {
+    const translationSettings = await getTranslationSettings();
+    const status = await TranslationBridgeClient.checkHealth({
+      endpoint: translationSettings.bridgeEndpoint,
+    });
+    return { ok: true, status };
   }
 
   if (message.action === "GET_QUEUE_STATUS") {
@@ -201,6 +249,76 @@ async function initializeExtension() {
   await ensureSettings();
   await clearStaleProcessingState();
   await syncAnkiQueueState({ suppressErrors: true });
+  await syncBridgeClient().catch((error) => {
+    console.warn("Could not synchronize translation bridge:", error);
+  });
+  await syncProviderVisibilityShim().catch((error) => {
+    console.warn("Could not register the provider visibility shim:", error);
+  });
+}
+
+// Registers the MAIN-world shim on every provider page we have permission for.
+// Without it Chrome suspends requestAnimationFrame in the background tab we
+// translate in, the provider never renders its result, and the capture times
+// out until the user focuses the tab. Registration follows the granted host
+// permissions, so it re-syncs whenever the user grants or revokes one.
+async function syncProviderVisibilityShim() {
+  const matches = [];
+
+  for (const provider of KNOWN_TRANSLATION_PROVIDERS) {
+    const granted = await chrome.permissions.contains({
+      origins: [provider.hostPermission],
+    });
+
+    if (granted) {
+      matches.push(provider.hostPermission);
+    }
+  }
+
+  const [existing] = await chrome.scripting
+    .getRegisteredContentScripts({ ids: [PROVIDER_VISIBILITY_SHIM_ID] })
+    .catch(() => []);
+
+  if (!matches.length) {
+    if (existing) {
+      await chrome.scripting.unregisterContentScripts({
+        ids: [PROVIDER_VISIBILITY_SHIM_ID],
+      });
+    }
+
+    return;
+  }
+
+  const script = {
+    id: PROVIDER_VISIBILITY_SHIM_ID,
+    js: ["translation/page-visibility-shim.js"],
+    matches,
+    runAt: "document_start",
+    world: "MAIN",
+    persistAcrossSessions: true,
+  };
+
+  if (existing) {
+    await chrome.scripting.updateContentScripts([script]);
+    return;
+  }
+
+  await chrome.scripting.registerContentScripts([script]);
+}
+
+// Starts the App-Support translation bridge client when the extension is in
+// app-support mode, and stops it otherwise. Safe to call repeatedly.
+async function syncBridgeClient() {
+  const appMode = await getAppMode();
+  const translationSettings = await getTranslationSettings();
+
+  if (appMode === "app-support") {
+    TranslationBridgeClient.start({
+      endpoint: translationSettings.bridgeEndpoint,
+    });
+  } else {
+    TranslationBridgeClient.stop();
+  }
 }
 
 async function startRecording(tabId) {
@@ -489,6 +607,10 @@ async function handleRecordingComplete(message) {
       let completionMessage = `Saved to ${finalTranscriptPath}`;
       let statusText = `Transcript saved to ${finalTranscriptPath}`;
 
+      const translationProviderLabel = getTranslationProvider(
+        translationSettings.provider,
+      ).label;
+
       if (translationSettings.enabled) {
         await setRecorderState({
           isRecording: false,
@@ -498,12 +620,12 @@ async function handleRecordingComplete(message) {
           lastDurationMs: durationMs,
           lastAudioPath: audioPath,
           lastTranscriptPath: finalTranscriptPath,
-          statusText: "Transcript ready. Waiting for Google Translate...",
+          statusText: `Transcript ready. Waiting for ${translationProviderLabel}...`,
           errorText: "",
         });
 
         const translationResult = await TranslationService.capture(
-          "google-translate",
+          translationSettings.provider,
           transcriptText,
         );
         translatedText = translationResult.translatedText;
@@ -526,6 +648,7 @@ async function handleRecordingComplete(message) {
       const translationCaptured = Boolean(translatedText);
       const translationSuffix = buildTranslationStatusSuffix({
         enabled: translationSettings.enabled,
+        providerLabel: translationProviderLabel,
         translatedText,
         translationError,
       });
@@ -547,9 +670,9 @@ async function handleRecordingComplete(message) {
       }
 
       if (translationSettings.enabled && translationError) {
-        completionMessage = `${completionMessage} Google Translate could not be read, so the transcript-only note was used.`;
+        completionMessage = `${completionMessage} ${translationProviderLabel} could not be read, so the transcript-only note was used.`;
       } else if (translationCaptured) {
-        completionMessage = `${completionMessage} Google Translate output was captured.`;
+        completionMessage = `${completionMessage} ${translationProviderLabel} output was captured.`;
       }
 
       if (saveLocationError) {
@@ -1166,12 +1289,14 @@ function buildTranslationStatusSuffix(options = {}) {
     return "";
   }
 
+  const providerLabel = options.providerLabel || "Translation";
+
   if (options.translatedText) {
-    return " Google Translate output captured.";
+    return ` ${providerLabel} output captured.`;
   }
 
   if (options.translationError) {
-    return ` Google Translate fallback used: ${options.translationError}`;
+    return ` ${providerLabel} fallback used: ${options.translationError}`;
   }
 
   return "";

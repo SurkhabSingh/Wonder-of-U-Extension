@@ -353,6 +353,104 @@
       .hint.error {
         color: var(--danger);
       }
+
+      .header-status {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 6px;
+      }
+
+      /* Sits under the state pill in the header as a compact chip, rather than
+         as a full-width bar between the header and the content. */
+      .mode-bar {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(44, 30, 24, 0.05);
+        font-size: 11px;
+        line-height: 1.6;
+        white-space: nowrap;
+        color: var(--muted);
+      }
+
+      .mode-bar strong {
+        font-weight: 700;
+        color: var(--text);
+      }
+
+      .mode-bar .link-button {
+        font-size: 11px;
+      }
+
+      .link-button {
+        border: none;
+        background: none;
+        padding: 0;
+        margin: 0;
+        font: inherit;
+        font-weight: 700;
+        color: var(--accent);
+        cursor: pointer;
+        text-decoration: underline;
+      }
+
+      .mode-chooser {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .mode-card {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        text-align: left;
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid rgba(102, 71, 58, 0.16);
+        background: rgba(255, 252, 248, 0.96);
+        color: var(--text);
+      }
+
+      .mode-card:hover:not(:disabled) {
+        box-shadow: 0 10px 22px rgba(187, 77, 47, 0.16);
+      }
+
+      .mode-card-title {
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .mode-card-desc {
+        font-size: 12px;
+        font-weight: 400;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+
+      .bridge-card {
+        margin-top: 12px;
+        padding: 12px 13px;
+        border-radius: 14px;
+        background: rgba(44, 30, 24, 0.05);
+      }
+
+      .bridge-status {
+        margin: 6px 0 0;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .bridge-status.connected {
+        color: var(--success);
+      }
+
+      .bridge-status.disconnected {
+        color: var(--warning);
+      }
     </style>
   </head>
   <body>
@@ -360,15 +458,43 @@
       <div class="header">
         <div>
           <h1 class="title">Wonder of U</h1>
-          <p class="subtitle">
+          <p id="subtitle" class="subtitle">
             Capture the current tab's audio, save it, and optionally transcribe
             it locally.
           </p>
         </div>
-        <div id="statePill" class="pill">Idle</div>
+        <div class="header-status">
+          <div id="statePill" class="pill">Idle</div>
+          <div id="modeBar" class="mode-bar" hidden>
+            <strong id="modeName">Solo</strong>
+            <button id="changeModeBtn" class="link-button" type="button">
+              change
+            </button>
+          </div>
+        </div>
       </div>
 
-      <section class="timer-card">
+      <section id="modeChooser" class="section mode-chooser" hidden>
+        <p class="section-title">Choose how to use Wonder of U</p>
+        <button id="chooseSolo" class="mode-card" type="button">
+          <span class="mode-card-title">Standalone (Solo)</span>
+          <span class="mode-card-desc">
+            Record tab audio, transcribe locally, translate, and push to Anki —
+            everything inside the extension.
+          </span>
+        </button>
+        <button id="chooseAppSupport" class="mode-card" type="button">
+          <span class="mode-card-title">Wonder of U app (App Support)</span>
+          <span class="mode-card-desc">
+            Act as a translation worker for the Wonder of U desktop app and Anki
+            plugin. Keep this browser open while translating there.
+          </span>
+        </button>
+        <p id="modeError" class="hint error" hidden></p>
+      </section>
+
+      <div id="soloView" hidden>
+        <section class="timer-card">
         <div class="timer-label">Elapsed Time</div>
         <div id="timer" class="timer-value">00:00</div>
       </section>
@@ -484,22 +610,25 @@
 
           <div class="field">
             <label for="whisperLanguage">Language</label>
-            <input
-              id="whisperLanguage"
-              type="text"
-              placeholder="ja"
-              autocomplete="off"
-            />
+            <select id="whisperLanguage"></select>
           </div>
 
           <div class="field">
-            <label for="ankiDeckName">Anki deck name</label>
+            <label for="ankiDeckName">Anki deck</label>
+            <div class="path-input-row">
+              <select id="ankiDeckName"></select>
+              <button id="refreshAnkiDecks" class="browse-button" type="button">
+                Refresh
+              </button>
+            </div>
             <input
-              id="ankiDeckName"
+              id="ankiDeckNameFallback"
               type="text"
               placeholder="Audio Immersion"
               autocomplete="off"
+              hidden
             />
+            <p id="ankiDeckHint" class="hint" hidden></p>
           </div>
         </div>
 
@@ -526,20 +655,25 @@
         <p class="section-title">Translation</p>
 
         <div class="field">
+          <label for="translationProvider">Provider</label>
+          <select id="translationProvider"></select>
+        </div>
+
+        <div class="field">
           <label class="toggle">
             <input id="translationEnabled" type="checkbox" />
-            <span>Capture Google Translate output</span>
+            <span>Capture translation output</span>
           </label>
         </div>
 
         <p class="hint">
-          When enabled, the extension opens or reuses
-          <code>https://translate.google.com</code>, pastes the transcript,
-          waits for the translated text, and uses it in Anki when available.
+          When enabled, the extension opens the selected translation site in a
+          background tab, pastes the transcript, waits for the translated text,
+          then closes the tab and uses the result in Anki when available.
         </p>
         <p class="hint">
-          If Google Translate cannot be read or permission is not granted, the
-          extension falls back to the current transcript-only Anki behavior.
+          If the provider cannot be read or permission is not granted, the
+          extension falls back to the transcript-only Anki behavior.
         </p>
       </section>
 
@@ -558,14 +692,40 @@
         </div>
       </section>
 
-      <section class="section">
-        <p class="section-title">Status</p>
-        <p id="status" class="status">Idle</p>
-        <p class="hotkeys">
-          Hotkeys: <code>Ctrl+Shift+1</code> starts,
-          <code>Ctrl+Shift+2</code> stops.
-        </p>
-      </section>
+        <section class="section">
+          <p class="section-title">Status</p>
+          <p id="status" class="status">Idle</p>
+          <p class="hotkeys">
+            Hotkeys: <code>Ctrl+Shift+1</code> starts,
+            <code>Ctrl+Shift+2</code> stops.
+          </p>
+        </section>
+      </div>
+
+      <div id="appSupportView" hidden>
+        <section class="section">
+          <p class="section-title">Translation worker</p>
+
+          <div class="field">
+            <label for="appSupportProvider">Provider</label>
+            <select id="appSupportProvider"></select>
+          </div>
+
+          <div class="bridge-card">
+            <div class="queue-label">Bridge connection</div>
+            <p id="bridgeStatus" class="bridge-status disconnected">Checking…</p>
+          </div>
+
+          <p class="hint">
+            This mode serves translation requests from the Wonder of U desktop
+            app and the Anki plugin over a local connection. Keep this browser
+            open while translating in those apps.
+          </p>
+          <p class="hint">
+            "Not connected" is expected until one of those apps is running.
+          </p>
+        </section>
+      </div>
     </main>
 
     <script src="utils.js"></script>
