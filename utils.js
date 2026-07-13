@@ -29,10 +29,38 @@ const KNOWN_TRANSLATION_PROVIDERS = [
   },
 ];
 const DEFAULT_TRANSLATION_PROVIDER = KNOWN_TRANSLATION_PROVIDERS[0].id;
+const DEFAULT_TARGET_LANGUAGE = "en";
 const DEFAULT_TRANSLATION_SETTINGS = {
   enabled: false,
   provider: DEFAULT_TRANSLATION_PROVIDER,
   bridgeEndpoint: DEFAULT_BRIDGE_ENDPOINT,
+  targetLanguage: DEFAULT_TARGET_LANGUAGE,
+  deeplApiKey: "",
+};
+// Anki field mapping, mirroring the desktop app's. Each role is either mapped to a
+// field name on the chosen note type, or left blank to be skipped.
+//
+// The defaults reproduce the behaviour this extension had before mapping existed
+// (audio on the front, transcript on the back of a Basic note), so an existing
+// install keeps working untouched until the user changes something.
+const DEFAULT_ANKI_NOTE_TYPE = "Basic";
+const ANKI_FIELD_ROLES = [
+  { key: "audio", label: "Audio" },
+  { key: "transcription", label: "Transcript" },
+  { key: "translation", label: "Translation" },
+  { key: "sourcePath", label: "Source file" },
+  { key: "createdAt", label: "Created at" },
+];
+const DEFAULT_ANKI_FIELD_MAP = {
+  audio: "Front",
+  transcription: "Back",
+  translation: "",
+  sourcePath: "",
+  createdAt: "",
+};
+const DEFAULT_ANKI_SETTINGS = {
+  noteType: DEFAULT_ANKI_NOTE_TYPE,
+  fields: { ...DEFAULT_ANKI_FIELD_MAP },
 };
 const DEFAULT_ANKI_QUEUE_STATE = {
   pendingCount: 0,
@@ -181,6 +209,7 @@ async function ensureSettings() {
     "recorderState",
     "transcriptionSettings",
     "translationSettings",
+    "ankiSettings",
     "ankiQueueState",
     "appMode",
   ]);
@@ -238,6 +267,15 @@ async function ensureSettings() {
       JSON.stringify(data.transcriptionSettings)
   ) {
     updates.transcriptionSettings = normalizedTranscriptionSettings;
+  }
+
+  const normalizedAnkiSettings = normalizeAnkiSettings(data.ankiSettings);
+
+  if (
+    !data.ankiSettings ||
+    JSON.stringify(normalizedAnkiSettings) !== JSON.stringify(data.ankiSettings)
+  ) {
+    updates.ankiSettings = normalizedAnkiSettings;
   }
 
   if (Object.keys(updates).length > 0) {
@@ -358,7 +396,87 @@ function normalizeTranslationSettings(settings) {
     enabled: Boolean(settings?.enabled),
     provider: sanitizeTranslationProvider(settings?.provider),
     bridgeEndpoint: sanitizeBridgeEndpoint(settings?.bridgeEndpoint),
+    targetLanguage: sanitizeTargetLanguage(settings?.targetLanguage),
+    deeplApiKey: sanitizeDeeplApiKey(settings?.deeplApiKey),
   };
+}
+
+// The language the extension translates *into* when the caller does not say. A
+// job from the desktop app carries its own targetLang and overrides this; Solo
+// mode has no such caller, so this is what it uses.
+function sanitizeTargetLanguage(language) {
+  const normalized = String(language || "").trim().toLowerCase();
+
+  if (!normalized || normalized === "auto") {
+    return DEFAULT_TARGET_LANGUAGE;
+  }
+
+  const isKnown = WHISPER_LANGUAGE_OPTIONS.some(
+    (option) => option.code === normalized,
+  );
+
+  return isKnown ? normalized : DEFAULT_TARGET_LANGUAGE;
+}
+
+function sanitizeDeeplApiKey(apiKey) {
+  return String(apiKey || "").trim();
+}
+
+async function getAnkiSettings() {
+  const data = await chrome.storage.local.get("ankiSettings");
+  return normalizeAnkiSettings(data.ankiSettings);
+}
+
+async function updateAnkiSettings(partialSettings) {
+  const currentSettings = await getAnkiSettings();
+  const nextSettings = normalizeAnkiSettings({
+    ...currentSettings,
+    ...(partialSettings || {}),
+    fields: {
+      ...currentSettings.fields,
+      ...(partialSettings?.fields || {}),
+    },
+  });
+
+  await chrome.storage.local.set({ ankiSettings: nextSettings });
+  return nextSettings;
+}
+
+function normalizeAnkiSettings(settings) {
+  const fields = {};
+
+  for (const role of ANKI_FIELD_ROLES) {
+    const mapped = settings?.fields?.[role.key];
+    fields[role.key] =
+      typeof mapped === "string" ? mapped.trim() : DEFAULT_ANKI_FIELD_MAP[role.key];
+  }
+
+  return {
+    noteType:
+      String(settings?.noteType || "").trim() || DEFAULT_ANKI_NOTE_TYPE,
+    fields,
+  };
+}
+
+// DeepL free-plan keys end in ":fx" and MUST go to api-free; sending one to the
+// Pro host returns an explicit "wrong endpoint" error. The popup needs this to
+// request the right host permission, and the provider needs it to call the right
+// URL, so it lives here rather than in either of them.
+const DEEPL_FREE_API_ORIGIN = "https://api-free.deepl.com";
+const DEEPL_PRO_API_ORIGIN = "https://api.deepl.com";
+
+function deeplApiOriginForKey(apiKey) {
+  return sanitizeDeeplApiKey(apiKey).endsWith(":fx")
+    ? DEEPL_FREE_API_ORIGIN
+    : DEEPL_PRO_API_ORIGIN;
+}
+
+function deeplApiHostPermissionForKey(apiKey) {
+  return `${deeplApiOriginForKey(apiKey)}/*`;
+}
+
+function deeplApiEndpointForKey(apiKey) {
+  return `${deeplApiOriginForKey(apiKey)}/v2/translate`;
 }
 
 function sanitizeTranslationProvider(provider) {

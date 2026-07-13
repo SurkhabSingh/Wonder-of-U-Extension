@@ -1,24 +1,42 @@
 (function initializeTranslationAutomation(globalScope) {
   "use strict";
 
-  // Chrome clamps timers to ~1s in hidden tabs, so the page renders (and our
-  // in-page polling runs) far slower in the background than in a focused tab.
-  // These budgets are sized for the throttled case.
+  // Drives a provider website (Google Translate, DeepL) through DOM automation.
+  //
+  // The tab we drive is always hidden, and Chrome is hostile to hidden tabs: it
+  // suspends requestAnimationFrame entirely, clamps timers to 1s (then to once a
+  // minute after five minutes), and stops rendering altogether when the window is
+  // minimized. There is no extension-accessible opt-out. So the automation is
+  // built to lean on as little of that machinery as possible:
+  //
+  //   * navigate with the text and languages already in the URL, so the page
+  //     translates on load and we never depend on typing or input debounce;
+  //   * detect completion with a MutationObserver, which fires on DOM changes
+  //     rather than on a clamped timer;
+  //   * read `textContent`, not `innerText`, because `innerText` needs layout and
+  //     layout is suspended in a minimized window.
+  //
+  // It is still best-effort by nature. Anything that must not fail belongs on an
+  // HTTP provider (see DeepL's API-key path), not here.
+
   const DEFAULT_TIMING = Object.freeze({
     tabLoadTimeoutMs: 15000,
     pageTimeoutMs: 45000,
-    pollIntervalMs: 100,
-    stableWindowMs: 1500,
+    stableWindowMs: 1200,
+    injectRetryDelayMs: 400,
+    // Backstop only. The MutationObserver does the real work; this just gives the
+    // stability window a tick to elapse on a page that has gone quiet.
+    backstopIntervalMs: 250,
   });
 
-  // Builds a browser-assisted translation provider that drives a provider
-  // website (Google Translate, DeepL, ...) through DOM automation. Every part
-  // of `config` is JSON-serializable so the page automation can be handed to
-  // `chrome.scripting.executeScript` unchanged.
+  // Guards against a pathological transcript spawning hundreds of tabs.
+  const MAX_CHUNKS = 24;
+  const OWNED_TABS_KEY = "providerTabIds";
+
   function createBrowserTranslationProvider(providerConfig) {
     const config = normalizeConfig(providerConfig);
 
-    async function capture(sourceText) {
+    async function capture(sourceText, options = {}) {
       const normalizedSource = String(sourceText || "").trim();
 
       if (!normalizedSource) {
@@ -33,41 +51,67 @@
         return createFailure(config, `${config.label} permission is missing.`);
       }
 
-      let tabId = null;
+      const sourceLang = normalizeLanguage(options.sourceLang, "auto");
+      const targetLang = normalizeLanguage(options.targetLang, "en");
 
-      try {
-        const tab = await openProviderTab(config);
-        tabId = tab?.id ?? null;
+      // Provider pages silently truncate anything past their input cap, so a long
+      // transcript has to be translated in pieces and reassembled.
+      const chunks = splitIntoChunks(normalizedSource, config.maxChunkChars);
 
-        const outcome = await runAutomationWithRetry(config, tabId, normalizedSource);
-
-        if (!outcome?.ok) {
-          return createFailure(
-            config,
-            outcome?.error ||
-              `${config.label} could not be read for this transcript.`,
-          );
-        }
-
-        const translatedText = String(outcome.text || "").trim();
-        if (!translatedText) {
-          return createFailure(config, `${config.label} returned an empty result.`);
-        }
-
-        return {
-          providerId: config.id,
-          translatedText,
-          errorText: "",
-        };
-      } catch (error) {
+      if (chunks.length > MAX_CHUNKS) {
         return createFailure(
           config,
-          error?.message ||
-            `${config.label} could not be read for this transcript.`,
+          `The transcript is too long for ${config.label} (${chunks.length} parts).`,
         );
-      } finally {
-        await closeProviderTab(tabId);
       }
+
+      const translatedChunks = [];
+
+      // A multi-chunk transcript reuses one warm tab: the first chunk arrives via
+      // the deep link (which is also what sets the languages), and the rest are
+      // typed into the page that is already loaded. That turns N page loads into
+      // one. The tab is still closed at the end of the job — a tab left hidden for
+      // more than five minutes crosses Chrome's intensive-throttling and freezing
+      // thresholds, so keeping one alive indefinitely trades a page load for a tab
+      // that quietly stops responding.
+      if (chunks.length > 1) {
+        const shared = await translateChunksInOneTab(
+          config,
+          chunks,
+          sourceLang,
+          targetLang,
+        );
+
+        if (shared.ok) {
+          translatedChunks.push(...shared.texts);
+        }
+      }
+
+      // Either a single chunk, or the warm tab did not see it through. Fall back to
+      // a fresh tab per chunk, which is the slower but sturdier path.
+      if (!translatedChunks.length) {
+        for (const chunk of chunks) {
+          const outcome = await translateChunk(config, chunk, sourceLang, targetLang);
+
+          if (!outcome.ok) {
+            return createFailure(config, outcome.error);
+          }
+
+          translatedChunks.push(outcome.text);
+        }
+      }
+
+      const translatedText = translatedChunks.join("\n").trim();
+
+      if (!translatedText) {
+        return createFailure(config, `${config.label} returned an empty result.`);
+      }
+
+      return {
+        providerId: config.id,
+        translatedText,
+        errorText: "",
+      };
     }
 
     return Object.freeze({
@@ -77,63 +121,201 @@
     });
   }
 
+  // Two attempts, and they are deliberately different.
+  //
+  // The first carries the text in the URL, so the page translates on load and we
+  // never touch the input box. If the text is too long to survive a URL, the
+  // provider says so and we type it instead — the languages still come from the
+  // URL either way, which is how the target-language setting takes effect.
+  //
+  // The second is always a typing attempt in a brand-new tab. It covers a deep
+  // link the provider quietly ignored, a redirect, or a consent interstitial. A
+  // provider that fails both ways is genuinely unreachable, not merely unlucky.
+  async function translateChunk(config, chunk, sourceLang, targetLang) {
+    const deepLink = config.buildUrl({ sourceLang, targetLang, text: chunk });
+    const bareLink = config.buildUrl({ sourceLang, targetLang, text: "" });
+
+    const attempts = [
+      { url: deepLink.url, typeText: !deepLink.includesText },
+      { url: bareLink.url, typeText: true },
+    ];
+
+    let lastError = "";
+
+    for (const attempt of attempts) {
+      const outcome = await runAttempt(config, attempt, chunk);
+
+      if (outcome.ok && String(outcome.text || "").trim()) {
+        return { ok: true, text: String(outcome.text).trim() };
+      }
+
+      lastError = outcome.error || lastError;
+    }
+
+    return {
+      ok: false,
+      error: lastError || `${config.label} could not be read for this transcript.`,
+    };
+  }
+
+  // Translates every chunk through a single tab. The first chunk rides the deep
+  // link so the languages are set; each later chunk is typed into the same loaded
+  // page, so the provider's app is booted once instead of once per chunk.
+  async function translateChunksInOneTab(config, chunks, sourceLang, targetLang) {
+    let tabId = null;
+    const texts = [];
+
+    try {
+      await globalScope.ProviderVisibilityShim.sync();
+
+      const first = config.buildUrl({ sourceLang, targetLang, text: chunks[0] });
+      const tab = await openProviderTab(first.url);
+      tabId = tab?.id ?? null;
+
+      if (!tabId) {
+        return { ok: false };
+      }
+
+      await rememberOwnedTab(tabId);
+
+      for (let index = 0; index < chunks.length; index += 1) {
+        const outcome = await runAutomationWithRetry(config, tabId, {
+          sourceText: chunks[index],
+          // Only the first chunk can come from the URL; the rest are typed.
+          typeText: index > 0 || !first.includesText,
+          // The previous chunk's translation is still on screen. Without this the
+          // wait would settle immediately on that stale text and every chunk after
+          // the first would return the first one's translation.
+          previousText: index > 0 ? texts[index - 1] : "",
+          shimMarkerAttribute:
+          globalScope.ProviderVisibilityShim.markerAttribute,
+        });
+
+        const text = String(outcome?.text || "").trim();
+
+        if (!outcome?.ok || !text) {
+          return { ok: false };
+        }
+
+        texts.push(text);
+      }
+
+      return { ok: true, texts };
+    } catch {
+      return { ok: false };
+    } finally {
+      await closeProviderTab(tabId);
+    }
+  }
+
+  async function runAttempt(config, attempt, chunk) {
+    let tabId = null;
+
+    try {
+      // Re-assert the visibility shim before the tab exists, so it is registered
+      // in time to run at document_start. Google renders through
+      // requestAnimationFrame, which Chrome suspends in a hidden tab, so without
+      // the shim this capture cannot succeed at all — see translation/provider-shim.js.
+      await globalScope.ProviderVisibilityShim.sync();
+
+      const tab = await openProviderTab(attempt.url);
+      tabId = tab?.id ?? null;
+
+      if (!tabId) {
+        return { ok: false, error: `${config.label} tab could not be opened.` };
+      }
+
+      await rememberOwnedTab(tabId);
+
+      const request = {
+        sourceText: chunk,
+        typeText: attempt.typeText,
+        shimMarkerAttribute:
+          globalScope.ProviderVisibilityShim.markerAttribute,
+      };
+
+      let outcome = await runAutomationWithRetry(config, tabId, request);
+
+      // The page reports whether the shim actually arrived. If it did not, this
+      // tab was never going to render Google's result — reload it now that
+      // registration has been re-asserted, and give it one more go, rather than
+      // failing with a timeout that says nothing about the real cause.
+      if (!outcome?.ok && outcome?.shimMissing) {
+        await chrome.tabs.reload(tabId);
+        outcome = await runAutomationWithRetry(config, tabId, request);
+
+        if (!outcome?.ok && outcome?.shimMissing) {
+          const reason = globalScope.ProviderVisibilityShim.getLastError();
+          return {
+            ok: false,
+            error: `${config.label} cannot render in a background tab because the page helper did not load${reason ? `: ${reason}` : "."}`,
+          };
+        }
+      }
+
+      return outcome;
+    } catch (error) {
+      return {
+        ok: false,
+        error:
+          error?.message ||
+          `${config.label} could not be read for this transcript.`,
+      };
+    } finally {
+      await closeProviderTab(tabId);
+    }
+  }
+
   function normalizeConfig(providerConfig) {
-    if (!providerConfig?.id || !providerConfig?.url || !providerConfig?.hostPermission) {
+    if (
+      !providerConfig?.id ||
+      !providerConfig?.hostPermission ||
+      typeof providerConfig?.buildUrl !== "function"
+    ) {
       throw new Error(
-        "Translation providers require id, url, and hostPermission.",
+        "Translation providers require id, hostPermission, and buildUrl.",
       );
     }
 
     const selectors = providerConfig.selectors || {};
-    const output = selectors.output || {};
+    const timing = { ...DEFAULT_TIMING, ...(providerConfig.timing || {}) };
 
     return Object.freeze({
       id: String(providerConfig.id),
       label: String(providerConfig.label || providerConfig.id),
-      url: String(providerConfig.url),
       hostPermission: String(providerConfig.hostPermission),
-      expectedHost: String(
-        providerConfig.expectedHost ||
-          String(providerConfig.url)
-            .replace(/^[a-z]+:\/\//i, "")
-            .split(/[/?#]/)[0] ||
-          "",
-      ),
-      tabLoadTimeoutMs:
-        providerConfig.tabLoadTimeoutMs || DEFAULT_TIMING.tabLoadTimeoutMs,
-      pageTimeoutMs:
-        providerConfig.pageTimeoutMs || DEFAULT_TIMING.pageTimeoutMs,
-      pollIntervalMs:
-        providerConfig.pollIntervalMs || DEFAULT_TIMING.pollIntervalMs,
-      stableWindowMs:
-        providerConfig.stableWindowMs || DEFAULT_TIMING.stableWindowMs,
-      selectors: Object.freeze({
-        input: String(selectors.input || ""),
-        inputFallbackCandidates: String(selectors.inputFallbackCandidates || ""),
-        output: Object.freeze({
-          mode: String(output.mode || "text"),
-          selector: String(output.selector || ""),
-          // Used when `selector` matches nothing — e.g. DeepL renders one <p>
-          // per sentence, but drops to a bare text node for a short phrase.
-          fallbackSelector: String(output.fallbackSelector || ""),
-          container: String(output.container || ""),
-          anchorSelector: String(output.anchorSelector || ""),
-          anchorText: String(output.anchorText || ""),
+      expectedHost: String(providerConfig.expectedHost || ""),
+      maxChunkChars: Number(providerConfig.maxChunkChars) || 4000,
+      buildUrl: providerConfig.buildUrl,
+      timing: Object.freeze(timing),
+      // Everything below crosses into the page via executeScript, so it must stay
+      // JSON-serializable.
+      pageConfig: Object.freeze({
+        label: String(providerConfig.label || providerConfig.id),
+        expectedHost: String(providerConfig.expectedHost || ""),
+        timing,
+        selectors: Object.freeze({
+          input: String(selectors.input || ""),
+          inputFallback: String(selectors.inputFallback || ""),
+          output: Object.freeze({
+            // A descent, one querySelector per step, each taking the FIRST match
+            // inside the previous. Google needs this: the flattened CSS equivalent
+            // of its chain also matches "Try again" and a handful of "." nodes, so
+            // only the first-descendant walk lands on the translation alone.
+            walk: Object.freeze([...(selectors.output?.walk || [])].map(String)),
+            // Plain selectors, tried in order, all matches joined. Used when there
+            // is no walk, and as the fallback when the walk finds nothing.
+            selectors: Object.freeze(
+              [...(selectors.output?.selectors || [])].map(String),
+            ),
+          }),
         }),
       }),
     });
   }
 
-  // Always drives a dedicated background tab, which is then closed. We do not
-  // reuse an existing provider tab: any deepl.com tab (pricing, docs, ...) would
-  // match the host pattern without having a translator on it, and a long-lived
-  // hidden tab hits Chrome's intensive timer throttling (~1 wake-up/minute after
-  // 5 minutes hidden), which stalls batch translation.
-  async function openProviderTab(config) {
-    return chrome.tabs.create({
-      url: config.url,
-      active: false,
-    });
+  async function openProviderTab(url) {
+    return chrome.tabs.create({ url, active: false });
   }
 
   async function closeProviderTab(tabId) {
@@ -144,24 +326,116 @@
     try {
       await chrome.tabs.remove(tabId);
     } catch {
-      // The tab was already closed (e.g. by the user) — nothing to clean up.
+      // Already closed (by the user, or by the orphan sweep).
+    } finally {
+      await forgetOwnedTab(tabId);
     }
+  }
+
+  // The worker can be torn down mid-capture, which skips the close above and
+  // strands a hidden tab. Recording the tabs we own lets startup clean up after a
+  // crash without touching provider tabs the user opened themselves.
+  async function rememberOwnedTab(tabId) {
+    try {
+      const stored = await chrome.storage.session.get(OWNED_TABS_KEY);
+      const owned = new Set(stored?.[OWNED_TABS_KEY] || []);
+      owned.add(tabId);
+      await chrome.storage.session.set({ [OWNED_TABS_KEY]: Array.from(owned) });
+    } catch {
+      // Session storage is unavailable; the tab still gets closed in `finally`.
+    }
+  }
+
+  async function forgetOwnedTab(tabId) {
+    try {
+      const stored = await chrome.storage.session.get(OWNED_TABS_KEY);
+      const owned = (stored?.[OWNED_TABS_KEY] || []).filter((id) => id !== tabId);
+      await chrome.storage.session.set({ [OWNED_TABS_KEY]: owned });
+    } catch {
+      // Nothing to clean up.
+    }
+  }
+
+  async function closeOwnedTabs() {
+    const stored = await chrome.storage.session.get(OWNED_TABS_KEY);
+    const owned = stored?.[OWNED_TABS_KEY] || [];
+
+    await Promise.all(
+      owned.map((tabId) => chrome.tabs.remove(tabId).catch(() => {})),
+    );
+
+    await chrome.storage.session.set({ [OWNED_TABS_KEY]: [] });
   }
 
   function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  // Injects the page automation and retries while the tab is still navigating
-  // (not injectable yet) or has not reached the provider page. We do NOT gate on
-  // the tab's "complete" status because heavy/SPA provider pages report it
-  // unreliably; instead the injected `waitUntil` decides when elements are ready.
-  async function runAutomationWithRetry(config, tabId, sourceText) {
-    if (!tabId) {
-      return { ok: false, error: `${config.label} tab could not be opened.` };
+  // Splits on paragraph, then sentence, then hard-wraps whatever is still too
+  // long, so a chunk never lands mid-word if it can be helped.
+  function splitIntoChunks(text, maxChars) {
+    const limit = Math.max(200, Number(maxChars) || 4000);
+
+    if (text.length <= limit) {
+      return [text];
     }
 
-    const deadline = Date.now() + config.tabLoadTimeoutMs + config.pageTimeoutMs;
+    const pieces = text
+      .split(/(?<=[.!?。！？\n])\s+/)
+      .flatMap((piece) => (piece.length <= limit ? [piece] : hardWrap(piece, limit)));
+
+    const chunks = [];
+    let current = "";
+
+    for (const piece of pieces) {
+      if (!current) {
+        current = piece;
+        continue;
+      }
+
+      if (`${current} ${piece}`.length <= limit) {
+        current = `${current} ${piece}`;
+        continue;
+      }
+
+      chunks.push(current);
+      current = piece;
+    }
+
+    if (current) {
+      chunks.push(current);
+    }
+
+    return chunks.filter((chunk) => chunk.trim());
+  }
+
+  function hardWrap(text, limit) {
+    const pieces = [];
+
+    for (let index = 0; index < text.length; index += limit) {
+      pieces.push(text.slice(index, index + limit));
+    }
+
+    return pieces;
+  }
+
+  function normalizeLanguage(value, fallback) {
+    const normalized = String(value || "").trim().toLowerCase();
+
+    if (!normalized || normalized === "auto") {
+      return fallback === "auto" ? "auto" : normalized || fallback;
+    }
+
+    return normalized;
+  }
+
+  // Re-injects while the tab is still navigating (not injectable yet) or has not
+  // reached the provider page. We do not gate on the tab's "complete" status:
+  // heavy SPA pages report it unreliably, so the injected script decides when the
+  // page is actually ready.
+  async function runAutomationWithRetry(config, tabId, request) {
+    const deadline =
+      Date.now() + config.timing.tabLoadTimeoutMs + config.timing.pageTimeoutMs;
     let lastError = "";
 
     while (Date.now() < deadline) {
@@ -171,12 +445,11 @@
         injectionResults = await chrome.scripting.executeScript({
           target: { tabId },
           func: runPageAutomation,
-          args: [sourceText, config],
+          args: [config.pageConfig, request],
         });
       } catch (error) {
-        // The frame is not injectable yet (still navigating / no document).
         lastError = error?.message || `${config.label} page is not reachable yet.`;
-        await delay(400);
+        await delay(config.timing.injectRetryDelayMs);
         continue;
       }
 
@@ -186,20 +459,24 @@
         return outcome;
       }
 
-      if (outcome?.retryable) {
-        // On the wrong document (about:blank or a redirect) — wait and retry.
-        lastError = outcome.error || lastError;
-        await delay(400);
+      // No result at all. The injection landed in a frame that was torn down
+      // mid-navigation — the provider page redirects, and we inject as soon as the
+      // tab exists, so this races by design. It is transient, not fatal: treating
+      // it as fatal is what made Google fail with "could not be read", because
+      // Google's redirect timing loses this race and DeepL's does not.
+      if (!outcome) {
+        lastError = `${config.label} page was still navigating.`;
+        await delay(config.timing.injectRetryDelayMs);
         continue;
       }
 
-      // A real, non-retryable automation failure (e.g. selectors not found).
-      return (
-        outcome || {
-          ok: false,
-          error: `${config.label} could not be read for this transcript.`,
-        }
-      );
+      if (outcome.retryable) {
+        lastError = outcome.error || lastError;
+        await delay(config.timing.injectRetryDelayMs);
+        continue;
+      }
+
+      return outcome;
     }
 
     return {
@@ -216,61 +493,11 @@
     };
   }
 
-  // Runs in the provider page's context (serialized by executeScript). Keep it
-  // fully self-contained: every helper it uses must be defined inline here.
-  async function runPageAutomation(sourceText, config) {
+  // Runs in the provider page (serialized by executeScript). Fully self-contained:
+  // every helper it uses is defined inline.
+  async function runPageAutomation(config, request) {
     const selectors = config.selectors;
-    const outputConfig = selectors.output;
-
-    function waitUntil(
-      predicate,
-      timeoutMs = 10000,
-      intervalMs = 100,
-      timeoutMessage = "The expected page condition was not met in time.",
-    ) {
-      return new Promise((resolve, reject) => {
-        let intervalId = null;
-        let timeoutId = null;
-        let settled = false;
-
-        const cleanup = () => {
-          if (intervalId !== null) {
-            window.clearInterval(intervalId);
-          }
-          if (timeoutId !== null) {
-            window.clearTimeout(timeoutId);
-          }
-        };
-
-        const finish = (callback, value) => {
-          if (settled) {
-            return;
-          }
-
-          settled = true;
-          cleanup();
-          callback(value);
-        };
-
-        const evaluate = () => {
-          try {
-            const value = predicate();
-            if (value) {
-              finish(resolve, value);
-            }
-          } catch (error) {
-            finish(reject, error);
-          }
-        };
-
-        intervalId = window.setInterval(evaluate, intervalMs);
-        timeoutId = window.setTimeout(() => {
-          finish(reject, new Error(timeoutMessage));
-        }, timeoutMs);
-
-        evaluate();
-      });
-    }
+    const timing = config.timing;
 
     function normalizeText(value) {
       return String(value || "")
@@ -283,23 +510,62 @@
     }
 
     function cleanTranslatedText(value) {
-      return normalizeText(String(value || "").replace(/\bstar_border\b/gi, " "));
+      // Google leaks Material icon ligatures into the text of its result container.
+      return normalizeText(
+        String(value || "").replace(/\b(star_border|content_copy|volume_up)\b/gi, " "),
+      );
     }
 
-    function isVisible(element) {
-      if (!element) {
-        return false;
+    // Descends one selector at a time, taking the first match at each step.
+    function readWalkText() {
+      const steps = selectors.output.walk;
+
+      if (!steps.length) {
+        return "";
       }
 
-      const rect = element.getBoundingClientRect();
-      const style = window.getComputedStyle(element);
-      return (
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden" &&
-        style.opacity !== "0"
-      );
+      let node = document;
+
+      for (const step of steps) {
+        node = node.querySelector(step);
+
+        if (!node) {
+          return "";
+        }
+      }
+
+      return cleanTranslatedText(node.textContent || "");
+    }
+
+    // `textContent`, never `innerText`: innerText is layout-dependent, and layout
+    // does not run in a tab whose window is minimized, so it can come back empty
+    // on exactly the pages we care about.
+    function readOutputText() {
+      const walked = readWalkText();
+
+      if (walked) {
+        return walked;
+      }
+
+      for (const selector of selectors.output.selectors) {
+        if (!selector) {
+          continue;
+        }
+
+        // Providers split a translation across sibling nodes (DeepL renders one
+        // <p> per sentence), so every match is joined rather than just the first.
+        const combined = Array.from(document.querySelectorAll(selector))
+          .map((node) => node.textContent || "")
+          .filter((text) => text.trim())
+          .join("\n");
+
+        const cleaned = cleanTranslatedText(combined);
+        if (cleaned) {
+          return cleaned;
+        }
+      }
+
+      return "";
     }
 
     function isEditable(element) {
@@ -316,140 +582,16 @@
     }
 
     function resolveInputElement() {
-      const primaryMatches = selectors.input
-        ? Array.from(document.querySelectorAll(selectors.input))
-        : [];
+      const candidates = [selectors.input, selectors.inputFallback].filter(Boolean);
 
-      const primary = primaryMatches.find(
-        (element) => isEditable(element) && isVisible(element),
-      );
-
-      if (primary) {
-        return primary;
-      }
-
-      if (!selectors.inputFallbackCandidates) {
-        // A never-painted background tab can report zero-sized rects, so accept
-        // an editable match that only failed the visibility check.
-        return primaryMatches.find(isEditable) || null;
-      }
-
-      return (
-        Array.from(
-          document.querySelectorAll(selectors.inputFallbackCandidates),
-        )
-          .filter((element) => isEditable(element) && isVisible(element))
-          .map((element) => {
-            const rect = element.getBoundingClientRect();
-            const label = String(
-              element.getAttribute("aria-label") ||
-                element.getAttribute("data-placeholder") ||
-                element.getAttribute("placeholder") ||
-                "",
-            ).toLowerCase();
-            let score = 0;
-
-            if (rect.left < window.innerWidth * 0.6) {
-              score += 40;
-            }
-            if (rect.width >= 120) {
-              score += 20;
-            }
-            if (rect.height >= 32) {
-              score += 15;
-            }
-            if (
-              label.includes("source") ||
-              label.includes("translate") ||
-              label.includes("text")
-            ) {
-              score += 30;
-            }
-
-            return { element, score };
-          })
-          .sort((left, right) => right.score - left.score)[0]?.element ||
-        primaryMatches.find(isEditable) ||
-        null
-      );
-    }
-
-    function extractGoogleCopySpan() {
-      const container = outputConfig.container
-        ? document.querySelector(outputConfig.container)
-        : null;
-      if (!container) {
-        return "";
-      }
-
-      const ltrDiv = container.querySelector('div div[dir="ltr"]');
-      if (!ltrDiv) {
-        return "";
-      }
-
-      // Walk the nested spans Google renders for the translated string; fall
-      // back to the container text if the structure shifts.
-      let node = ltrDiv;
-      for (let depth = 0; depth < 3; depth += 1) {
-        const span = node.querySelector("span");
-        if (!span) {
-          break;
+      for (const selector of candidates) {
+        const match = Array.from(document.querySelectorAll(selector)).find(isEditable);
+        if (match) {
+          return match;
         }
-        node = span;
       }
 
-      return cleanTranslatedText(
-        node?.innerText || node?.textContent || ltrDiv.textContent || "",
-      );
-    }
-
-    function extractAnchorSibling() {
-      if (!outputConfig.anchorSelector || !outputConfig.anchorText) {
-        return "";
-      }
-
-      const anchor = Array.from(
-        document.querySelectorAll(outputConfig.anchorSelector),
-      ).find(
-        (element) =>
-          isVisible(element) &&
-          String(element.textContent || "").trim() === outputConfig.anchorText,
-      );
-      const outputNode = anchor
-        ?.closest(outputConfig.anchorSelector)
-        ?.previousElementSibling?.querySelector(outputConfig.container);
-
-      return cleanTranslatedText(
-        outputNode?.innerText || outputNode?.textContent || "",
-      );
-    }
-
-    function resolveOutputText() {
-      if (outputConfig.mode === "google-copy-span") {
-        return extractGoogleCopySpan() || extractAnchorSibling();
-      }
-
-      // Plain-text mode (e.g. DeepL): providers may split the translation across
-      // several sibling elements (one per sentence), so join them all.
-      if (!outputConfig.selector) {
-        return "";
-      }
-
-      const combined = Array.from(
-        document.querySelectorAll(outputConfig.selector),
-      )
-        .map((node) => node.innerText || node.textContent || "")
-        .filter((text) => text.trim())
-        .join("\n");
-
-      if (combined.trim() || !outputConfig.fallbackSelector) {
-        return cleanTranslatedText(combined);
-      }
-
-      const fallbackNode = document.querySelector(outputConfig.fallbackSelector);
-      return cleanTranslatedText(
-        fallbackNode?.innerText || fallbackNode?.textContent || "",
-      );
+      return null;
     }
 
     function setInputText(element, value) {
@@ -471,25 +613,16 @@
         } else {
           element.value = text;
         }
-      } else if (
-        element.isContentEditable ||
-        element.getAttribute("role") === "textbox"
-      ) {
-        // Rich editors (DeepL) hold their own model of the content, so writing
-        // textContent leaves them unaware that anything changed. Drive it as a
-        // real edit instead: select everything, then insert — or delete, when
-        // clearing — and only fall back to a raw write if that is refused.
+      } else {
+        // Rich editors (DeepL) keep their own model of the content, so writing
+        // textContent leaves them unaware anything changed. Drive a real edit.
         const selection = window.getSelection();
         const range = document.createRange();
         range.selectNodeContents(element);
         selection.removeAllRanges();
         selection.addRange(range);
 
-        const applied = text
-          ? document.execCommand("insertText", false, text)
-          : document.execCommand("delete");
-
-        if (!applied) {
+        if (!document.execCommand("insertText", false, text)) {
           element.dispatchEvent(
             new InputEvent("beforeinput", {
               bubbles: true,
@@ -506,17 +639,122 @@
         new InputEvent("input", {
           bubbles: true,
           data: text,
-          inputType: text ? "insertText" : "deleteContentBackward",
+          inputType: "insertText",
         }),
       );
       element.dispatchEvent(new Event("change", { bubbles: true }));
     }
 
-    // Bail early (and ask the caller to retry) if the tab has not reached the
-    // provider page yet — e.g. it is still on about:blank or a redirect.
+    function waitForElement(resolve_, timeoutMs, message) {
+      return new Promise((resolve, reject) => {
+        const existing = resolve_();
+        if (existing) {
+          resolve(existing);
+          return;
+        }
+
+        let settled = false;
+
+        const finish = (callback, value) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          observer.disconnect();
+          clearTimeout(timeoutId);
+          clearInterval(backstopId);
+          callback(value);
+        };
+
+        const check = () => {
+          const found = resolve_();
+          if (found) {
+            finish(resolve, found);
+          }
+        };
+
+        const observer = new MutationObserver(check);
+        observer.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+        });
+
+        const backstopId = setInterval(check, timing.backstopIntervalMs);
+        const timeoutId = setTimeout(() => {
+          finish(reject, new Error(message));
+        }, timeoutMs);
+      });
+    }
+
+    // A translation arrives as a burst of DOM mutations and then goes quiet. So:
+    // watch for mutations, and accept the text once it has stopped changing for
+    // `stableWindowMs`. The interval is only a backstop that lets that window
+    // elapse on a page that has stopped mutating — Chrome clamps it to 1s in a
+    // hidden tab, which is fine for that job and fatal for anything else.
+    function waitForStableOutput(timeoutMs) {
+      const previousText = String(request.previousText || "");
+
+      return new Promise((resolve, reject) => {
+        let lastText = "";
+        let lastChangedAt = Date.now();
+        let settled = false;
+
+        const finish = (callback, value) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          observer.disconnect();
+          clearTimeout(timeoutId);
+          clearInterval(backstopId);
+          callback(value);
+        };
+
+        const check = () => {
+          const current = readOutputText();
+
+          // When a tab is reused across chunks, the previous chunk's translation is
+          // still sitting in the output. Treat it as "nothing yet", or the wait
+          // settles on stale text and every later chunk returns the first one's
+          // translation.
+          if (!current || current === previousText) {
+            return;
+          }
+
+          if (current !== lastText) {
+            lastText = current;
+            lastChangedAt = Date.now();
+            return;
+          }
+
+          if (Date.now() - lastChangedAt >= timing.stableWindowMs) {
+            finish(resolve, current);
+          }
+        };
+
+        const observer = new MutationObserver(check);
+        observer.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+
+        const backstopId = setInterval(check, timing.backstopIntervalMs);
+        const timeoutId = setTimeout(() => {
+          finish(
+            reject,
+            new Error(`${config.label} did not produce a translation in time.`),
+          );
+        }, timeoutMs);
+
+        check();
+      });
+    }
+
+    // Still navigating, or on a redirect/interstitial. Ask the caller to retry.
     if (
       config.expectedHost &&
-      !window.location.hostname.includes(config.expectedHost)
+      !window.location.hostname.endsWith(config.expectedHost)
     ) {
       return {
         ok: false,
@@ -525,73 +763,48 @@
       };
     }
 
+    // The shim marks the <html> element. It cannot signal us through `window`:
+    // this code runs in the extension's ISOLATED world and the shim runs in the
+    // page's MAIN world, so the two have different `window` objects and share only
+    // the DOM. Knowing whether the shim arrived is what separates "the page is
+    // slow" from "the page was never going to render".
+    const shimActive = document.documentElement.hasAttribute(
+      request.shimMarkerAttribute,
+    );
+
+    // Read the *native* getter: the shim overrides visibilityState on the document
+    // instance, so the plain property would always answer "visible" once it is in.
+    let reallyHidden = false;
     try {
-      const inputElement = await waitUntil(
-        resolveInputElement,
-        config.pageTimeoutMs,
-        config.pollIntervalMs,
-        `${config.label} input field was not found in time.`,
-      );
-      const normalizedSource = normalizeText(sourceText);
-      const baselineText = resolveOutputText();
+      reallyHidden =
+        Object.getOwnPropertyDescriptor(
+          Document.prototype,
+          "visibilityState",
+        )?.get?.call(document) === "hidden";
+    } catch {
+      reallyHidden = false;
+    }
 
-      setInputText(inputElement, "");
+    try {
+      if (request.typeText) {
+        const inputElement = await waitForElement(
+          resolveInputElement,
+          timing.pageTimeoutMs,
+          `${config.label} input field was not found in time.`,
+        );
 
-      let outputWasCleared = !resolveOutputText();
-      if (!outputWasCleared && baselineText) {
-        try {
-          await waitUntil(
-            () => {
-              outputWasCleared = !resolveOutputText();
-              return outputWasCleared;
-            },
-            Math.min(3000, config.pageTimeoutMs),
-            config.pollIntervalMs,
-            `${config.label} output did not clear.`,
-          );
-        } catch {
-          outputWasCleared = false;
-        }
+        setInputText(inputElement, normalizeText(request.sourceText));
       }
 
-      setInputText(inputElement, normalizedSource);
-
-      let lastText = "";
-      let lastChangedAt = Date.now();
-
-      const translatedText = await waitUntil(
-        () => {
-          const currentText = resolveOutputText();
-          if (!currentText) {
-            outputWasCleared = true;
-            return null;
-          }
-
-          const isFresh =
-            outputWasCleared || !baselineText || currentText !== baselineText;
-          if (!isFresh) {
-            return null;
-          }
-
-          if (currentText !== lastText) {
-            lastText = currentText;
-            lastChangedAt = Date.now();
-            return null;
-          }
-
-          return Date.now() - lastChangedAt >= config.stableWindowMs
-            ? currentText
-            : null;
-        },
-        config.pageTimeoutMs,
-        config.pollIntervalMs,
-        `${config.label} has not produced a fresh translated text yet.`,
-      );
-
-      return { ok: true, text: translatedText };
+      const translatedText = await waitForStableOutput(timing.pageTimeoutMs);
+      return { ok: true, text: translatedText, shimActive };
     } catch (error) {
       return {
         ok: false,
+        shimActive,
+        // Only a real diagnosis when the tab is actually hidden: a visible tab
+        // renders with or without the shim, so a failure there is a different bug.
+        shimMissing: !shimActive && reallyHidden,
         error: error?.message || `${config.label} could not be read.`,
       };
     }
@@ -599,5 +812,12 @@
 
   globalScope.WonderTranslationAutomation = Object.freeze({
     createBrowserTranslationProvider,
+    closeOwnedTabs,
+    splitIntoChunks,
+    // Exposed so it can be exercised in a real browser exactly as
+    // chrome.scripting.executeScript runs it: serialized, in an isolated world.
+    // Testing it any other way misses that the page's MAIN world and this
+    // isolated world do not share a `window`.
+    runPageAutomation,
   });
 })(self);

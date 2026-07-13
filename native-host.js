@@ -19,21 +19,82 @@ const APP_DATA_DIR =
 const ANKI_QUEUE_FILE = path.join(APP_DATA_DIR, "anki-queue.json");
 const QUEUED_MEDIA_DIR = path.join(APP_DATA_DIR, "queued-media");
 
+// Message types owned by the translation bridge worker rather than the one-shot
+// request handlers below.
+const BRIDGE_MESSAGE_TYPES = new Set([
+  "bridge-start",
+  "bridge-stop",
+  "bridge-result",
+  "bridge-fail",
+]);
+
+let pendingOperations = 0;
+let inputEnded = false;
+
 main();
 
-async function main() {
-  try {
-    const message = await readNativeMessage();
-    const payload = await handleNativeMessage(message);
-    writeNativeMessage({
-      ok: true,
-      ...payload,
+// The host serves two callers over the same stdio framing:
+//
+//   * `chrome.runtime.sendNativeMessage` spawns us, writes one request, reads one
+//     reply, and closes stdin. That is the transcription/Anki path, unchanged.
+//   * `chrome.runtime.connectNative` keeps the process alive for the life of the
+//     port. That is the translation bridge, and it is the whole reason this is a
+//     message loop rather than a single read: an open native port is the only
+//     thing Chrome documents as keeping an MV3 service worker alive, cancelling
+//     both the 30s idle timeout and the 5-minute cap. Holding the loopback HTTP
+//     here (instead of in the worker) also means Chrome's fetch limits, CORS, and
+//     Local Network Access never apply to it.
+function main() {
+  startNativeMessageStream({
+    onMessage: (message) => {
+      dispatchNativeMessage(message);
+    },
+    // Chrome closes stdin when it disconnects the port (or when a one-shot
+    // request is done). Either way there is nobody left to serve, so stop the
+    // bridge — without this the worker keeps polling and the process never exits,
+    // leaking a node process for every App-Support session.
+    onEnd: () => {
+      inputEnded = true;
+      TranslationBridgeWorker.stop();
+      maybeExit();
+    },
+    onError: () => {
+      inputEnded = true;
+      TranslationBridgeWorker.stop();
+      maybeExit();
+    },
+  });
+}
+
+function dispatchNativeMessage(message) {
+  if (BRIDGE_MESSAGE_TYPES.has(message?.type)) {
+    TranslationBridgeWorker.handle(message);
+    return;
+  }
+
+  pendingOperations += 1;
+
+  handleNativeMessage(message)
+    .then((payload) => {
+      writeNativeMessage({ ok: true, ...payload });
+    })
+    .catch((error) => {
+      writeNativeMessage({
+        ok: false,
+        error: error?.message || "Native host failed.",
+      });
+    })
+    .finally(() => {
+      pendingOperations -= 1;
+      maybeExit();
     });
-  } catch (error) {
-    writeNativeMessage({
-      ok: false,
-      error: error?.message || "Native host failed.",
-    });
+}
+
+// Chrome closes stdin once a one-shot request is answered. Stay alive while a
+// reply is still in flight, and while the bridge port is connected.
+function maybeExit() {
+  if (inputEnded && pendingOperations === 0 && !TranslationBridgeWorker.isRunning()) {
+    process.exit(0);
   }
 }
 
@@ -64,6 +125,14 @@ async function handleNativeMessage(message) {
 
   if (message?.type === "list-anki-decks") {
     return listAnkiDecks(message);
+  }
+
+  if (message?.type === "list-anki-note-types") {
+    return listAnkiNoteTypes(message);
+  }
+
+  if (message?.type === "list-anki-fields") {
+    return listAnkiFields(message);
   }
 
   if (message?.type === "queue-anki-card") {
@@ -251,13 +320,38 @@ function normalizeAnkiConfig(anki) {
   parsedUrl.search = "";
   parsedUrl.hash = "";
 
+  const modelName =
+    String(anki?.modelName || anki?.noteType || "Basic").trim() || "Basic";
+
+  // The field map is authoritative when present. Older callers (and older queued
+  // jobs on disk) only knew about frontField/backField, so fall back to those so
+  // an existing queue still pushes after an upgrade.
+  const legacyFront = String(anki?.frontField || "Front").trim() || "Front";
+  const legacyBack = String(anki?.backField || "Back").trim() || "Back";
+  const mapped = anki?.fields;
+
+  const fields = mapped
+    ? {
+        audio: String(mapped.audio || "").trim(),
+        transcription: String(mapped.transcription || "").trim(),
+        translation: String(mapped.translation || "").trim(),
+        sourcePath: String(mapped.sourcePath || "").trim(),
+        createdAt: String(mapped.createdAt || "").trim(),
+      }
+    : {
+        audio: legacyFront,
+        transcription: legacyBack,
+        translation: "",
+        sourcePath: "",
+        createdAt: "",
+      };
+
   return {
     enabled: Boolean(anki?.enabled),
     connectUrl: parsedUrl.toString(),
     deckName: String(anki?.deckName || "Audio Immersion").trim() || "Audio Immersion",
-    modelName: String(anki?.modelName || "Basic").trim() || "Basic",
-    frontField: String(anki?.frontField || "Front").trim() || "Front",
-    backField: String(anki?.backField || "Back").trim() || "Back",
+    modelName,
+    fields,
   };
 }
 
@@ -386,8 +480,7 @@ async function buildAnkiJob(job, transcriptPath, options = {}) {
     connectUrl: job.anki.connectUrl,
     deckName: job.anki.deckName,
     modelName: job.anki.modelName,
-    frontField: job.anki.frontField,
-    backField: job.anki.backField,
+    fields: job.anki.fields,
     recordingName:
       job.recordingName || sanitizeName(path.basename(job.audioPath, path.extname(job.audioPath))),
     audioPath: job.audioPath,
@@ -399,6 +492,55 @@ async function buildAnkiJob(job, transcriptPath, options = {}) {
       job.mediaFilename || buildAnkiMediaFilename(job.audioPath, job.recordingName),
     tags: job.tags || [...DEFAULT_ANKI_TAGS, buildJobTag(jobId)],
   };
+}
+
+// Fills only the roles the user actually mapped. An unmapped role is skipped
+// entirely rather than written as an empty string, so it cannot clobber a field
+// the user populates elsewhere.
+//
+// The one special case is translation: if there is a translation but no field to
+// put it in, it is appended to the transcript rather than thrown away — that is
+// what this extension did before mapping existed, and silently losing a
+// translation would be worse than putting it somewhere reasonable.
+function buildAnkiNoteFields(job) {
+  const map = job.fields || {};
+  const fields = {};
+  const translation = normalizeMultilineText(job.translatedText);
+  const foldTranslationIn = Boolean(translation) && !map.translation;
+
+  if (map.audio) {
+    fields[map.audio] = `[sound:${job.mediaFilename}]`;
+  }
+
+  if (map.transcription) {
+    const transcript = foldTranslationIn
+      ? formatTranscriptForAnkiField(job.transcriptText, translation)
+      : formatTranscriptForAnkiField(job.transcriptText);
+
+    fields[map.transcription] = transcript || "(Transcript unavailable)";
+  }
+
+  if (map.translation && translation) {
+    fields[map.translation] = formatTranscriptForAnkiField(translation);
+  }
+
+  if (map.sourcePath) {
+    fields[map.sourcePath] = escapeHtml(job.audioPath || "");
+  }
+
+  if (map.createdAt) {
+    fields[map.createdAt] = new Date().toISOString();
+  }
+
+  // AnkiConnect rejects a note with no fields at all, and a note with nothing in
+  // it would be useless anyway.
+  if (Object.keys(fields).length === 0) {
+    throw new Error(
+      "No Anki fields are mapped. Choose which fields to fill in the extension popup.",
+    );
+  }
+
+  return fields;
 }
 
 async function createAnkiCard(job) {
@@ -434,17 +576,11 @@ async function createAnkiCard(job) {
       data: audioData,
     });
 
-    const transcriptHtml =
-      job.transcriptHtml || formatTranscriptForAnkiField(job.transcriptText);
-
     const noteId = await invokeAnki(job.connectUrl, "addNote", {
       note: {
         deckName: job.deckName,
         modelName: job.modelName,
-        fields: {
-          [job.frontField]: `[sound:${job.mediaFilename}]`,
-          [job.backField]: transcriptHtml || "(Transcript unavailable)",
-        },
+        fields: buildAnkiNoteFields(job),
         options: {
           allowDuplicate: true,
         },
@@ -967,6 +1103,48 @@ async function listAnkiDecks(message) {
   };
 }
 
+// Anki's own catalog, so the popup can offer real note types and real field names
+// instead of asking the user to type them. Like the deck list, this has to go
+// through the native host: AnkiConnect's CORS allow-list rejects chrome-extension
+// origins outright.
+async function listAnkiNoteTypes(message) {
+  const anki = normalizeAnkiConfig({ ...message?.anki, enabled: true });
+  const noteTypes = await invokeAnki(anki.connectUrl, "modelNames", {});
+
+  if (!Array.isArray(noteTypes)) {
+    throw new Error("Anki did not return a note type list.");
+  }
+
+  return {
+    noteTypes: noteTypes
+      .map((noteType) => String(noteType || "").trim())
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right)),
+  };
+}
+
+async function listAnkiFields(message) {
+  const anki = normalizeAnkiConfig({ ...message?.anki, enabled: true });
+  const noteType = String(message?.noteType || anki.modelName || "").trim();
+
+  if (!noteType) {
+    throw new Error("A note type is required to list its fields.");
+  }
+
+  const fields = await invokeAnki(anki.connectUrl, "modelFieldNames", {
+    modelName: noteType,
+  });
+
+  if (!Array.isArray(fields)) {
+    throw new Error(`Anki did not return the fields for "${noteType}".`);
+  }
+
+  return {
+    noteType,
+    fields: fields.map((field) => String(field || "").trim()).filter(Boolean),
+  };
+}
+
 function invokeAnki(connectUrl, action, params = {}) {
   const parsedUrl = new URL(connectUrl);
   const body = JSON.stringify({
@@ -1056,75 +1234,417 @@ function isRetryableAnkiError(error) {
   );
 }
 
-function readNativeMessage() {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalLength = 0;
-    let settled = false;
+// Client half of the translation bridge (see translation/BRIDGE.md). The `/v1`
+// HTTP contract is unchanged — this process simply became the thing that speaks
+// it, instead of the service worker. The worker now only does the part that
+// genuinely needs a browser: driving the provider page.
+const TranslationBridgeWorker = (() => {
+  const PROTOCOL = "1";
+  const LONG_POLL_SECONDS = 25;
+  const LONG_POLL_TIMEOUT_MS = 40000;
+  const HEALTH_TIMEOUT_MS = 5000;
+  const RESULT_TIMEOUT_MS = 15000;
+  const HEARTBEAT_MS = 20000;
+  const MIN_RECONNECT_MS = 1000;
+  const MAX_RECONNECT_MS = 30000;
+  // How long the extension gets to translate one job before we give it back to
+  // the host as failed. Stays under the desktop app's own 90s job timeout.
+  const JOB_TIMEOUT_MS = 75000;
 
-    const cleanup = () => {
-      process.stdin.removeListener("data", onData);
-      process.stdin.removeListener("end", onEnd);
-      process.stdin.removeListener("error", onError);
-    };
+  let running = false;
+  let endpoint = "";
+  let generation = 0;
+  let reconnectFailures = 0;
+  let heartbeatTimer = null;
+  const inFlightJobs = new Map();
 
-    const tryResolveMessage = () => {
-      if (settled || totalLength < 4) {
+  function isRunning() {
+    return running;
+  }
+
+  function handle(message) {
+    if (message.type === "bridge-start") {
+      start(message.endpoint);
+      return;
+    }
+
+    if (message.type === "bridge-stop") {
+      stop();
+      return;
+    }
+
+    if (message.type === "bridge-result" || message.type === "bridge-fail") {
+      const pending = inFlightJobs.get(message.id);
+      if (!pending) {
+        // The job already timed out, or the worker restarted and is answering a
+        // job from a previous connection. Either way the host has moved on.
         return;
       }
 
-      try {
-        const buffer = Buffer.concat(chunks, totalLength);
-        const messageLength = buffer.readUInt32LE(0);
+      inFlightJobs.delete(message.id);
+      clearTimeout(pending.timer);
 
-        if (totalLength < 4 + messageLength) {
+      if (message.type === "bridge-result") {
+        pending.resolve({ ok: true, text: String(message.translatedText || "") });
+      } else {
+        pending.resolve({
+          ok: false,
+          error: String(message.error || "The extension could not translate this text."),
+        });
+      }
+    }
+  }
+
+  function start(nextEndpoint) {
+    const sanitized = sanitizeEndpoint(nextEndpoint);
+
+    if (running && sanitized === endpoint) {
+      return;
+    }
+
+    stop();
+    endpoint = sanitized;
+    running = true;
+    generation += 1;
+    reconnectFailures = 0;
+
+    startHeartbeat();
+    void loop(generation);
+  }
+
+  function stop() {
+    running = false;
+    generation += 1;
+
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+
+    for (const pending of inFlightJobs.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({ ok: false, error: "The translation bridge stopped." });
+    }
+    inFlightJobs.clear();
+  }
+
+  // Every message we push resets the service worker's idle timer, so this is
+  // both a liveness signal for the popup and a belt-and-braces keepalive.
+  function startHeartbeat() {
+    heartbeatTimer = setInterval(() => {
+      writeNativeMessage({ type: "bridge-heartbeat" });
+    }, HEARTBEAT_MS);
+
+    if (typeof heartbeatTimer.unref === "function") {
+      heartbeatTimer.unref();
+    }
+  }
+
+  async function loop(token) {
+    while (running && token === generation) {
+      try {
+        const health = await probeHealth();
+        reconnectFailures = 0;
+        postStatus({ connected: true, version: health.version, lastError: "" });
+
+        while (running && token === generation) {
+          const job = await claimNextJob();
+          if (!running || token !== generation) {
+            return;
+          }
+          if (job) {
+            await runJob(job);
+          }
+        }
+      } catch (error) {
+        if (!running || token !== generation) {
           return;
         }
 
-        const messageBuffer = buffer.subarray(4, 4 + messageLength);
-        settled = true;
-        cleanup();
-        resolve(JSON.parse(messageBuffer.toString("utf8")));
-      } catch (error) {
-        settled = true;
-        cleanup();
-        reject(error);
+        reconnectFailures += 1;
+        postStatus({
+          connected: false,
+          version: "",
+          lastError: describeError(error),
+        });
+
+        await sleep(reconnectDelayMs(reconnectFailures));
       }
-    };
+    }
+  }
 
-    const onData = (chunk) => {
-      chunks.push(Buffer.from(chunk));
-      totalLength += chunk.length;
-      tryResolveMessage();
-    };
+  // Exponential backoff with jitter, so a host that is down does not get probed
+  // every three seconds forever.
+  function reconnectDelayMs(failures) {
+    const capped = Math.min(MAX_RECONNECT_MS, MIN_RECONNECT_MS * 2 ** (failures - 1));
+    return Math.round(capped / 2 + Math.random() * (capped / 2));
+  }
 
-    const onEnd = () => {
-      if (settled) {
-        return;
-      }
+  async function probeHealth() {
+    const response = await request("/v1/health", { timeoutMs: HEALTH_TIMEOUT_MS });
 
-      settled = true;
-      cleanup();
-      reject(
-        new Error("Native host input stream ended before a full message arrived."),
+    if (response.status !== 200) {
+      throw new Error(
+        `${endpoint} is in use by another program (status ${response.status}). The Wonder of U app is not listening there.`,
       );
-    };
+    }
 
-    const onError = (error) => {
-      if (settled) {
+    const payload = parseJson(response.body);
+    const protocol = String(payload?.protocol || "");
+
+    if (protocol !== PROTOCOL) {
+      throw new Error(
+        protocol
+          ? `${endpoint} speaks bridge protocol ${protocol}, but this extension needs ${PROTOCOL}.`
+          : `${endpoint} answered, but it is not a Wonder of U bridge host.`,
+      );
+    }
+
+    return { version: String(payload?.version || "") };
+  }
+
+  async function claimNextJob() {
+    const response = await request(
+      `/v1/translation/next?wait=${LONG_POLL_SECONDS}`,
+      { timeoutMs: LONG_POLL_TIMEOUT_MS },
+    );
+
+    if (response.status === 204) {
+      return null;
+    }
+
+    if (response.status !== 200) {
+      throw new Error(`Bridge host returned status ${response.status}.`);
+    }
+
+    const job = parseJson(response.body);
+    if (!job?.id || typeof job.sourceText !== "string") {
+      return null;
+    }
+
+    return job;
+  }
+
+  // Hands the job to the extension and waits for it to come back. A worker that
+  // is torn down mid-job never answers, so the timeout is what stops the host
+  // from waiting out its full 90 seconds for a result that is never coming.
+  function awaitExtension(job) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        inFlightJobs.delete(job.id);
+        resolve({
+          ok: false,
+          error: "The extension did not return a translation in time.",
+        });
+      }, JOB_TIMEOUT_MS);
+
+      if (typeof timer.unref === "function") {
+        timer.unref();
+      }
+
+      inFlightJobs.set(job.id, { resolve, timer });
+      writeNativeMessage({ type: "bridge-job", job });
+    });
+  }
+
+  async function runJob(job) {
+    const outcome = await awaitExtension(job);
+
+    if (outcome.ok && outcome.text.trim()) {
+      await reportResult(`/v1/translation/jobs/${encodeURIComponent(job.id)}/complete`, {
+        translatedText: outcome.text,
+      });
+      return;
+    }
+
+    await reportResult(`/v1/translation/jobs/${encodeURIComponent(job.id)}/fail`, {
+      error: outcome.error || "The provider returned no translation.",
+    });
+  }
+
+  // A finished translation is expensive to produce — never drop it because a
+  // single POST blipped. Retry once, and surface the failure rather than
+  // pretending the post succeeded.
+  async function reportResult(path, body) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await request(path, {
+          method: "POST",
+          body: JSON.stringify(body),
+          timeoutMs: RESULT_TIMEOUT_MS,
+        });
+
+        if (response.status >= 200 && response.status < 300) {
+          return;
+        }
+
+        if (attempt === 1) {
+          postStatus({
+            connected: false,
+            version: "",
+            lastError: `The app rejected a translation result (status ${response.status}).`,
+          });
+          return;
+        }
+      } catch (error) {
+        if (attempt === 1) {
+          postStatus({
+            connected: false,
+            version: "",
+            lastError: describeError(error),
+          });
+          return;
+        }
+      }
+
+      await sleep(MIN_RECONNECT_MS);
+    }
+  }
+
+  function postStatus(status) {
+    writeNativeMessage({
+      type: "bridge-status",
+      endpoint,
+      ...status,
+    });
+  }
+
+  function request(requestPath, { method = "GET", body = null, timeoutMs } = {}) {
+    const parsedUrl = new URL(`${endpoint}${requestPath}`);
+
+    return new Promise((resolve, reject) => {
+      const headers = { Accept: "application/json" };
+
+      if (body !== null) {
+        headers["Content-Type"] = "application/json";
+        headers["Content-Length"] = Buffer.byteLength(body);
+      }
+
+      const clientRequest = http.request(
+        {
+          protocol: parsedUrl.protocol,
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port,
+          path: `${parsedUrl.pathname}${parsedUrl.search}`,
+          method,
+          headers,
+        },
+        (response) => {
+          const chunks = [];
+
+          response.on("data", (chunk) => chunks.push(chunk));
+          response.on("end", () => {
+            resolve({
+              status: response.statusCode || 0,
+              body: Buffer.concat(chunks).toString("utf8"),
+            });
+          });
+        },
+      );
+
+      clientRequest.setTimeout(timeoutMs, () => {
+        clientRequest.destroy(
+          new Error("The Wonder of U app did not respond in time."),
+        );
+      });
+
+      clientRequest.on("error", (error) => reject(error));
+
+      if (body !== null) {
+        clientRequest.write(body);
+      }
+
+      clientRequest.end();
+    });
+  }
+
+  function sanitizeEndpoint(value) {
+    const fallback = "http://127.0.0.1:8791";
+
+    try {
+      const parsed = new URL(String(value || fallback));
+
+      if (!LOCALHOST_HOSTS.has(parsed.hostname) || !parsed.port) {
+        return fallback;
+      }
+
+      return `${parsed.protocol}//${parsed.hostname}:${parsed.port}`;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function parseJson(body) {
+    try {
+      return JSON.parse(body);
+    } catch {
+      return null;
+    }
+  }
+
+  function describeError(error) {
+    const message = String(error?.message || error || "");
+
+    if (message.includes("ECONNREFUSED")) {
+      return "The Wonder of U app is not running.";
+    }
+
+    return message || "The bridge host is unreachable.";
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      if (typeof timer.unref === "function") {
+        timer.unref();
+      }
+    });
+  }
+
+  return { handle, isRunning, stop, reconnectDelayMs, sanitizeEndpoint };
+})();
+
+// Reads the 4-byte-length framing continuously, so one stdin stream can carry
+// many messages (a `connectNative` port) as well as a single one (`sendNativeMessage`).
+// Chrome may split or coalesce writes, so a partial frame is buffered until the
+// rest arrives, and a single chunk may contain several whole messages.
+function startNativeMessageStream({ onMessage, onEnd, onError }) {
+  let buffer = Buffer.alloc(0);
+
+  const drainMessages = () => {
+    for (;;) {
+      if (buffer.length < 4) {
         return;
       }
 
-      settled = true;
-      cleanup();
-      reject(error);
-    };
+      const messageLength = buffer.readUInt32LE(0);
+      if (buffer.length < 4 + messageLength) {
+        return;
+      }
 
-    process.stdin.on("data", onData);
-    process.stdin.on("end", onEnd);
-    process.stdin.on("error", onError);
-    process.stdin.resume();
+      const messageBuffer = buffer.subarray(4, 4 + messageLength);
+      buffer = buffer.subarray(4 + messageLength);
+
+      let message = null;
+
+      try {
+        message = JSON.parse(messageBuffer.toString("utf8"));
+      } catch (error) {
+        onError(new Error("Native host received a malformed message."));
+        return;
+      }
+
+      onMessage(message);
+    }
+  };
+
+  process.stdin.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+    drainMessages();
   });
+  process.stdin.on("end", () => onEnd());
+  process.stdin.on("error", (error) => onError(error));
+  process.stdin.resume();
 }
 
 function writeNativeMessage(payload) {

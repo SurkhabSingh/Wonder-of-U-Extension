@@ -15,6 +15,36 @@
   }
   window.__wonderOfUVisibilityShim = true;
 
+  // The automation runs in the extension's ISOLATED world, which has its own
+  // `window` — it cannot see the flag above at all. The DOM, however, is shared
+  // between the worlds, so the marker goes there instead.
+  //
+  // At document_start the parser has not built <html> yet, so documentElement is
+  // usually null and marking it right now would do nothing. Mark it as soon as it
+  // exists: the automation only reads this long after load, so being a beat late
+  // costs nothing, whereas never marking it makes every failure look like a
+  // missing shim.
+  const SHIM_MARKER = "data-wonder-of-u-shim";
+
+  function markDocument() {
+    if (!document.documentElement) {
+      return false;
+    }
+
+    document.documentElement.setAttribute(SHIM_MARKER, "1");
+    return true;
+  }
+
+  if (!markDocument()) {
+    const rootObserver = new MutationObserver(() => {
+      if (markDocument()) {
+        rootObserver.disconnect();
+      }
+    });
+
+    rootObserver.observe(document, { childList: true, subtree: true });
+  }
+
   // Captured before we override anything, so the shim can still tell whether the
   // tab is *really* hidden and leave the native rAF in charge when it is not.
   const nativeVisibility = Object.getOwnPropertyDescriptor(

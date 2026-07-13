@@ -37,9 +37,20 @@ const soloView = document.getElementById("soloView");
 const appSupportView = document.getElementById("appSupportView");
 const chooseSoloBtn = document.getElementById("chooseSolo");
 const chooseAppSupportBtn = document.getElementById("chooseAppSupport");
+const ankiNoteTypeSelect = document.getElementById("ankiNoteType");
+const refreshAnkiCatalogBtn = document.getElementById("refreshAnkiCatalog");
+const ankiFieldMapContainer = document.getElementById("ankiFieldMap");
+const ankiMappingHint = document.getElementById("ankiMappingHint");
 const translationProviderSelect = document.getElementById("translationProvider");
+const translationTargetLanguageSelect = document.getElementById(
+  "translationTargetLanguage",
+);
+const deeplApiKeyInput = document.getElementById("deeplApiKey");
+const saveDeeplApiKeyBtn = document.getElementById("saveDeeplApiKey");
+const deeplApiKeyHint = document.getElementById("deeplApiKeyHint");
 const appSupportProviderSelect = document.getElementById("appSupportProvider");
 const bridgeStatus = document.getElementById("bridgeStatus");
+const reconnectBridgeBtn = document.getElementById("reconnectBridge");
 
 let currentAppMode = DEFAULT_APP_MODE;
 let bridgeStatusInterval = null;
@@ -58,6 +69,11 @@ let avTestRunning = false;
 let ankiDecks = [];
 let ankiDeckError = "";
 let ankiDecksLoading = false;
+let currentAnkiSettings = DEFAULT_ANKI_SETTINGS;
+let ankiNoteTypes = [];
+let ankiFieldNames = [];
+let ankiCatalogError = "";
+let ankiCatalogLoading = false;
 
 initializePopup().catch((error) => {
   renderStatus("Unable to load popup settings.", "error");
@@ -262,6 +278,45 @@ appSupportProviderSelect.addEventListener("change", async () => {
   await handleProviderChange(appSupportProviderSelect.value);
 });
 
+ankiNoteTypeSelect.addEventListener("change", async () => {
+  await handleAnkiNoteTypeChange(ankiNoteTypeSelect.value);
+});
+
+refreshAnkiCatalogBtn.addEventListener("click", async () => {
+  await refreshAnkiCatalog();
+});
+
+translationTargetLanguageSelect.addEventListener("change", async () => {
+  await persistTranslationSettings({
+    targetLanguage: translationTargetLanguageSelect.value,
+  });
+});
+
+saveDeeplApiKeyBtn.addEventListener("click", async () => {
+  await handleDeeplApiKeySave();
+});
+
+reconnectBridgeBtn.addEventListener("click", async () => {
+  reconnectBridgeBtn.disabled = true;
+  bridgeStatus.textContent = "Reconnecting…";
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: "RECONNECT_BRIDGE",
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "The bridge could not be reconnected.");
+    }
+
+    renderBridgeStatus(response.status);
+  } catch (error) {
+    renderBridgeStatus({ connected: false, lastError: error.message });
+  } finally {
+    reconnectBridgeBtn.disabled = false;
+  }
+});
+
 chooseSoloBtn.addEventListener("click", async () => {
   await setMode("solo");
 });
@@ -276,7 +331,19 @@ chooseAppSupportBtn.addEventListener("click", async () => {
     return;
   }
 
-  await requestProviderPermission(currentTranslationSettings.provider);
+  // Without the provider's host permission every job fails the moment it starts,
+  // so refuse to enter the mode rather than enter it broken.
+  const providerGranted = await requestProviderPermission(
+    currentTranslationSettings.provider,
+  );
+
+  if (!providerGranted) {
+    renderModeError(
+      `${getTranslationProvider(currentTranslationSettings.provider).label} permission is needed to translate in App Support mode.`,
+    );
+    return;
+  }
+
   await setMode("app-support");
 });
 
@@ -310,6 +377,11 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
       changes.translationSettings.newValue
     );
     renderTranslationSettings();
+  }
+
+  if (changes.ankiSettings) {
+    currentAnkiSettings = normalizeAnkiSettings(changes.ankiSettings.newValue);
+    renderAnkiSettings();
   }
 
   if (changes.ankiQueueState) {
@@ -348,6 +420,7 @@ async function initializePopup() {
     recorderState,
     transcriptionSettings,
     translationSettings,
+    ankiSettings,
     ankiQueueState,
   ] =
     await Promise.all([
@@ -357,6 +430,7 @@ async function initializePopup() {
       getRecorderState(),
       getTranscriptionSettings(),
       getTranslationSettings(),
+      getAnkiSettings(),
       getAnkiQueueState(),
     ]);
 
@@ -367,10 +441,12 @@ async function initializePopup() {
   currentState = recorderState;
   currentTranscriptionSettings = transcriptionSettings;
   currentTranslationSettings = translationSettings;
+  currentAnkiSettings = ankiSettings;
   currentQueueState = ankiQueueState;
 
   renderTranscriptionSettings();
   renderTranslationSettings();
+  renderAnkiSettings();
   renderQueueState();
   renderQueueItems();
   renderRecorderState();
@@ -379,9 +455,10 @@ async function initializePopup() {
   if (currentAppMode === "solo") {
     await refreshQueueState();
     await refreshQueueItems();
-    // Not awaited: the deck list needs the native host, and a missing or slow
+    // Not awaited: these need the native host and Anki, and a missing or slow
     // host should not hold up the rest of the popup.
     refreshAnkiDecks().catch(() => {});
+    refreshAnkiCatalog().catch(() => {});
   }
 }
 
@@ -686,6 +763,156 @@ async function refreshAnkiDecks() {
   }
 }
 
+// Mirrors the desktop app's Anki mapping: pick a note type, then say which of its
+// fields each piece of the recording goes into. A role left as "Not mapped" is
+// skipped entirely rather than written blank, so it cannot clobber a field the
+// user fills in themselves.
+function renderAnkiSettings() {
+  renderAnkiNoteTypeSelect();
+  renderAnkiFieldMap();
+
+  refreshAnkiCatalogBtn.disabled = ankiCatalogLoading;
+  refreshAnkiCatalogBtn.textContent = ankiCatalogLoading ? "…" : "Refresh";
+
+  if (ankiCatalogError) {
+    ankiMappingHint.textContent = `${ankiCatalogError} The saved mapping is still used when Anki is reachable.`;
+    ankiMappingHint.hidden = false;
+    return;
+  }
+
+  const mapped = ANKI_FIELD_ROLES.filter(
+    (role) => currentAnkiSettings.fields[role.key],
+  );
+
+  ankiMappingHint.textContent = mapped.length
+    ? `Cards are created with ${mapped.map((role) => role.label.toLowerCase()).join(", ")}.`
+    : "Nothing is mapped yet, so no card can be created.";
+  ankiMappingHint.hidden = false;
+}
+
+function renderAnkiNoteTypeSelect() {
+  const noteType = currentAnkiSettings.noteType;
+  const options = ankiNoteTypes.map(
+    (name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`,
+  );
+
+  // Keep a note type that Anki has not confirmed (offline, or renamed) selectable
+  // rather than silently switching the user to something else.
+  if (noteType && !ankiNoteTypes.includes(noteType)) {
+    options.unshift(
+      `<option value="${escapeHtml(noteType)}">${escapeHtml(noteType)}${
+        ankiNoteTypes.length ? " (missing in Anki)" : ""
+      }</option>`,
+    );
+  }
+
+  ankiNoteTypeSelect.innerHTML = options.join("");
+  ankiNoteTypeSelect.value = noteType;
+}
+
+function renderAnkiFieldMap() {
+  const knownFields = ankiFieldNames.length ? ankiFieldNames : [];
+
+  ankiFieldMapContainer.innerHTML = ANKI_FIELD_ROLES.map((role) => {
+    const selected = currentAnkiSettings.fields[role.key] || "";
+    const options = [`<option value="">Not mapped</option>`];
+
+    for (const field of knownFields) {
+      options.push(
+        `<option value="${escapeHtml(field)}">${escapeHtml(field)}</option>`,
+      );
+    }
+
+    if (selected && !knownFields.includes(selected)) {
+      options.push(
+        `<option value="${escapeHtml(selected)}">${escapeHtml(selected)}${
+          knownFields.length ? " (missing in Anki)" : ""
+        }</option>`,
+      );
+    }
+
+    return `
+      <div class="field">
+        <label for="ankiField_${role.key}">${escapeHtml(role.label)}</label>
+        <select id="ankiField_${role.key}" data-anki-role="${role.key}">
+          ${options.join("")}
+        </select>
+      </div>`;
+  }).join("");
+
+  for (const role of ANKI_FIELD_ROLES) {
+    const select = document.getElementById(`ankiField_${role.key}`);
+    select.value = currentAnkiSettings.fields[role.key] || "";
+    select.addEventListener("change", async () => {
+      await persistAnkiSettings({ fields: { [role.key]: select.value } });
+    });
+  }
+}
+
+async function persistAnkiSettings(partialSettings) {
+  currentAnkiSettings = await updateAnkiSettings(partialSettings);
+  renderAnkiSettings();
+}
+
+async function handleAnkiNoteTypeChange(noteType) {
+  // Each note type has its own fields, so a mapping made against the old one is
+  // meaningless here. Clear it rather than carry over names that do not exist.
+  await persistAnkiSettings({
+    noteType,
+    fields: {
+      audio: "",
+      transcription: "",
+      translation: "",
+      sourcePath: "",
+      createdAt: "",
+    },
+  });
+
+  await refreshAnkiCatalog();
+}
+
+async function refreshAnkiCatalog() {
+  ankiCatalogLoading = true;
+  ankiCatalogError = "";
+  renderAnkiSettings();
+
+  try {
+    const typesResponse = await chrome.runtime.sendMessage({
+      action: "LIST_ANKI_NOTE_TYPES",
+    });
+
+    if (!typesResponse?.ok) {
+      throw new Error(typesResponse?.error || "Anki note types are unavailable.");
+    }
+
+    ankiNoteTypes = typesResponse.noteTypes || [];
+
+    const noteType = currentAnkiSettings.noteType;
+
+    if (noteType) {
+      const fieldsResponse = await chrome.runtime.sendMessage({
+        action: "LIST_ANKI_FIELDS",
+        noteType,
+      });
+
+      if (!fieldsResponse?.ok) {
+        throw new Error(fieldsResponse?.error || "Anki fields are unavailable.");
+      }
+
+      ankiFieldNames = fieldsResponse.fields || [];
+    } else {
+      ankiFieldNames = [];
+    }
+  } catch (error) {
+    ankiNoteTypes = [];
+    ankiFieldNames = [];
+    ankiCatalogError = error.message || "Anki could not be reached.";
+  } finally {
+    ankiCatalogLoading = false;
+    renderAnkiSettings();
+  }
+}
+
 function renderTranslationSettings() {
   translationEnabledInput.checked = currentTranslationSettings.enabled;
 
@@ -695,6 +922,51 @@ function renderTranslationSettings() {
   if (appSupportProviderSelect) {
     appSupportProviderSelect.value = currentTranslationSettings.provider;
   }
+
+  renderTargetLanguageSelect();
+  renderDeeplApiKeyField();
+}
+
+// The language the extension translates into. A job from the desktop app carries
+// its own target and overrides this, so this governs Solo mode.
+function renderTargetLanguageSelect() {
+  if (!translationTargetLanguageSelect) {
+    return;
+  }
+
+  const target = currentTranslationSettings.targetLanguage;
+  // "auto" is meaningless as a destination — you cannot translate *into* detect.
+  const options = WHISPER_LANGUAGE_OPTIONS.filter(
+    (option) => option.code !== "auto",
+  ).map(
+    (option) =>
+      `<option value="${escapeHtml(option.code)}">${escapeHtml(option.label)} (${escapeHtml(option.code)})</option>`,
+  );
+
+  translationTargetLanguageSelect.innerHTML = options.join("");
+  translationTargetLanguageSelect.value = target;
+}
+
+function renderDeeplApiKeyField() {
+  if (!deeplApiKeyInput) {
+    return;
+  }
+
+  const apiKey = currentTranslationSettings.deeplApiKey;
+
+  if (document.activeElement !== deeplApiKeyInput) {
+    deeplApiKeyInput.value = apiKey;
+  }
+
+  if (apiKey) {
+    deeplApiKeyHint.textContent = apiKey.endsWith(":fx")
+      ? "Saved. DeepL will use the free API (api-free.deepl.com) — no background tab."
+      : "Saved. DeepL will use the Pro API (api.deepl.com) — no background tab.";
+    return;
+  }
+
+  deeplApiKeyHint.textContent =
+    "With a key, DeepL is translated over its API instead of its website: no background tab, and it keeps working while the browser is minimized.";
 }
 
 function renderMode() {
@@ -741,8 +1013,24 @@ function syncBridgeStatusPolling(active) {
     return;
   }
 
+  // Paint the last known state immediately. Chrome may have torn the worker down
+  // since the popup was last open; asking it for status restarts it, and until
+  // its port is back up it would otherwise report "Not connected" and make a
+  // perfectly healthy setup look broken.
+  paintStoredBridgeStatus();
   refreshBridgeStatus();
   bridgeStatusInterval = window.setInterval(refreshBridgeStatus, 5000);
+}
+
+async function paintStoredBridgeStatus() {
+  try {
+    const stored = await chrome.storage.session.get("bridgeStatus");
+    if (stored?.bridgeStatus) {
+      renderBridgeStatus(stored.bridgeStatus);
+    }
+  } catch {
+    // No stored status yet; the live probe below fills it in.
+  }
 }
 
 async function refreshBridgeStatus() {
@@ -769,12 +1057,27 @@ function renderBridgeStatus(status) {
       ? `Connected · host ${status.version}`
       : "Connected";
   } else {
-    bridgeStatus.textContent = status?.lastError
-      ? `Not connected · ${status.lastError}`
-      : "Not connected";
+    const reason = describeBridgeError(status?.lastError);
+    bridgeStatus.textContent = reason ? `Not connected · ${reason}` : "Not connected";
   }
 
   bridgeStatus.className = `bridge-status ${connected ? "connected" : "disconnected"}`;
+}
+
+// Internal plumbing errors are not an explanation. Anything we cannot phrase for
+// a person is dropped, leaving the plain "Not connected".
+function describeBridgeError(lastError) {
+  const message = String(lastError || "").trim();
+
+  if (!message) {
+    return "";
+  }
+
+  if (/aborted|AbortError|signal is aborted/i.test(message)) {
+    return "";
+  }
+
+  return message;
 }
 
 async function setMode(mode) {
@@ -795,6 +1098,7 @@ async function setMode(mode) {
       await refreshQueueState();
       await refreshQueueItems();
       refreshAnkiDecks().catch(() => {});
+      refreshAnkiCatalog().catch(() => {});
     }
   } catch (error) {
     renderModeError(error.message || "Could not change the mode.");
@@ -839,6 +1143,35 @@ async function handleProviderChange(providerId) {
   }
 
   await persistTranslationSettings({ provider: providerId });
+}
+
+// Saving a key needs the matching DeepL API host permission, and which host that
+// is depends on the key itself (free keys end in ":fx"). Ask for it here, while
+// we still have the user gesture that chrome.permissions.request requires.
+async function handleDeeplApiKeySave() {
+  const apiKey = sanitizeDeeplApiKey(deeplApiKeyInput.value);
+
+  if (!apiKey) {
+    await persistTranslationSettings({ deeplApiKey: "" });
+    renderStatus("DeepL API key cleared. The DeepL website will be used.");
+    return;
+  }
+
+  const origins = [deeplApiHostPermissionForKey(apiKey)];
+  const granted =
+    (await chrome.permissions.contains({ origins })) ||
+    (await chrome.permissions.request({ origins }));
+
+  if (!granted) {
+    renderStatus(
+      "The DeepL API permission was not granted, so the key was not saved.",
+      "error",
+    );
+    return;
+  }
+
+  await persistTranslationSettings({ deeplApiKey: apiKey });
+  renderStatus("DeepL API key saved.");
 }
 
 function renderOutputDirectory() {

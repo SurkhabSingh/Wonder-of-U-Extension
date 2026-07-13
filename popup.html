@@ -639,16 +639,37 @@
           window open.
         </p>
         <p class="hint">
-          Successful jobs also try to create an Anki card in the deck name you
-          choose, with the audio on the front and the transcript on the back.
-          If the deck name does not exist in Anki, card creation fails but the
-          recording and transcript still save locally.
+          Successful jobs also try to create an Anki card in the deck you choose,
+          using the field mapping below. If the deck does not exist in Anki, card
+          creation fails but the recording and transcript still save locally.
         </p>
         <p class="hint">
           A strong starting point is <code>ggml-large-v3.bin</code> for better
           accuracy, but it is noticeably heavier and slower than smaller models
           on CPU.
         </p>
+      </section>
+
+      <section class="section">
+        <p class="section-title">Anki Mapping</p>
+
+        <div class="field">
+          <label for="ankiNoteType">Note type</label>
+          <div class="path-input-row">
+            <select id="ankiNoteType"></select>
+            <button id="refreshAnkiCatalog" class="browse-button" type="button">
+              Refresh
+            </button>
+          </div>
+          <p class="hint">
+            Changing the note type resets the mapping below, because each note
+            type has its own fields.
+          </p>
+        </div>
+
+        <div id="ankiFieldMap"></div>
+
+        <p id="ankiMappingHint" class="hint"></p>
       </section>
 
       <section class="section">
@@ -660,6 +681,32 @@
         </div>
 
         <div class="field">
+          <label for="translationTargetLanguage">Translate into</label>
+          <select id="translationTargetLanguage"></select>
+        </div>
+
+        <div class="field">
+          <label for="deeplApiKey">DeepL API key (optional)</label>
+          <div class="path-input-row">
+            <input
+              id="deeplApiKey"
+              type="password"
+              placeholder="Leave blank to drive the DeepL website"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="saveDeeplApiKey" class="browse-button" type="button">
+              Save
+            </button>
+          </div>
+          <p id="deeplApiKeyHint" class="hint">
+            With a key, DeepL is translated over its API instead of its website:
+            no background tab, and it keeps working while the browser is
+            minimized.
+          </p>
+        </div>
+
+        <div class="field">
           <label class="toggle">
             <input id="translationEnabled" type="checkbox" />
             <span>Capture translation output</span>
@@ -667,13 +714,16 @@
         </div>
 
         <p class="hint">
-          When enabled, the extension opens the selected translation site in a
-          background tab, pastes the transcript, waits for the translated text,
-          then closes the tab and uses the result in Anki when available.
+          When enabled, the extension loads the selected translation site in a
+          throwaway background tab with the transcript already in the URL, reads
+          the translated text, closes the tab, and uses the result in Anki when
+          available.
         </p>
         <p class="hint">
-          If the provider cannot be read or permission is not granted, the
-          extension falls back to the transcript-only Anki behavior.
+          Chrome throttles hidden tabs, so website-driven translation is
+          best-effort and works best with the browser window open. A DeepL API
+          key avoids the website entirely. If a provider cannot be read, the
+          extension falls back to transcript-only Anki notes.
         </p>
       </section>
 
@@ -712,14 +762,22 @@
           </div>
 
           <div class="bridge-card">
-            <div class="queue-label">Bridge connection</div>
-            <p id="bridgeStatus" class="bridge-status disconnected">Checking…</p>
+            <div class="queue-row">
+              <div>
+                <div class="queue-label">Bridge connection</div>
+                <p id="bridgeStatus" class="bridge-status disconnected">
+                  Checking…
+                </p>
+              </div>
+              <button id="reconnectBridge" type="button">Reconnect</button>
+            </div>
           </div>
 
           <p class="hint">
             This mode serves translation requests from the Wonder of U desktop
-            app and the Anki plugin over a local connection. Keep this browser
-            open while translating in those apps.
+            app and the Anki plugin over a local connection, through the Wonder
+            of U helper. Keep this browser open while translating in those apps
+            — it can stay minimized.
           </p>
           <p class="hint">
             "Not connected" is expected until one of those apps is running.

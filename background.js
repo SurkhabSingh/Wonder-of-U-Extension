@@ -1,20 +1,24 @@
 importScripts(
   "utils.js",
   "capture/browser-tab-capture-provider.js",
+  "translation/provider-shim.js",
   "translation/provider-automation.js",
   "translation/google-translate-provider.js",
   "translation/deepl-translate-provider.js",
+  "translation/deepl-api-provider.js",
   "translation/translation-service.js",
   "translation/bridge-client.js",
 );
 
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const NATIVE_TRANSCRIBER_HOST = "com.audio_recorder.whisper_host";
-const PROVIDER_VISIBILITY_SHIM_ID = "wonder-provider-visibility-shim";
+// The native port keeps this worker alive while it is connected, but nothing can
+// revive a worker that Chrome already tore down (say, while the bridge host was
+// unreachable and the port was closed). An alarm is the only thing that can:
+// alarms wake a dead worker, and 30s is the shortest period Chrome allows.
+const BRIDGE_WATCHDOG_ALARM = "wonder-bridge-watchdog";
+const BRIDGE_WATCHDOG_PERIOD_MINUTES = 0.5;
 const ANKI_CONNECT_URL = "http://127.0.0.1:8765";
-const ANKI_MODEL_NAME = "Basic";
-const ANKI_FRONT_FIELD = "Front";
-const ANKI_BACK_FIELD = "Back";
 let offscreenCreationPromise = null;
 
 initializeExtension().catch((error) => {
@@ -42,6 +46,21 @@ chrome.permissions.onAdded.addListener(() => {
 chrome.permissions.onRemoved.addListener(() => {
   syncProviderVisibilityShim().catch((error) => {
     console.warn("Could not update the provider visibility shim:", error);
+  });
+  // Revoking the loopback permission has to stop the bridge too, or it keeps
+  // retrying against a host it is no longer allowed to reach.
+  syncBridgeClient().catch((error) => {
+    console.warn("Could not synchronize translation bridge:", error);
+  });
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== BRIDGE_WATCHDOG_ALARM) {
+    return;
+  }
+
+  syncBridgeClient().catch((error) => {
+    console.warn("Bridge watchdog could not restore the connection:", error);
   });
 });
 
@@ -76,7 +95,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.action === "GET_APP_MODE" ||
     message?.action === "SET_APP_MODE" ||
     message?.action === "GET_BRIDGE_STATUS" ||
-    message?.action === "LIST_ANKI_DECKS"
+    message?.action === "RECONNECT_BRIDGE" ||
+    message?.action === "LIST_ANKI_DECKS" ||
+    message?.action === "LIST_ANKI_NOTE_TYPES" ||
+    message?.action === "LIST_ANKI_FIELDS"
   ) {
     handleControlMessage(message)
       .then((response) => sendResponse(response))
@@ -157,6 +179,29 @@ async function handleControlMessage(message) {
     return { ok: true, decks: response.decks || [] };
   }
 
+  if (message.action === "LIST_ANKI_NOTE_TYPES") {
+    const response = await requestNativeHostMessage({
+      type: "list-anki-note-types",
+      anki: { connectUrl: ANKI_CONNECT_URL },
+    });
+
+    return { ok: true, noteTypes: response.noteTypes || [] };
+  }
+
+  if (message.action === "LIST_ANKI_FIELDS") {
+    const response = await requestNativeHostMessage({
+      type: "list-anki-fields",
+      noteType: message.noteType,
+      anki: { connectUrl: ANKI_CONNECT_URL },
+    });
+
+    return {
+      ok: true,
+      noteType: response.noteType || "",
+      fields: response.fields || [],
+    };
+  }
+
   if (message.action === "GET_APP_MODE") {
     const appMode = await getAppMode();
     return { ok: true, appMode };
@@ -169,11 +214,15 @@ async function handleControlMessage(message) {
   }
 
   if (message.action === "GET_BRIDGE_STATUS") {
-    const translationSettings = await getTranslationSettings();
-    const status = await TranslationBridgeClient.checkHealth({
-      endpoint: translationSettings.bridgeEndpoint,
-    });
-    return { ok: true, status };
+    // Reports what the live port knows. It no longer fires its own HTTP probe:
+    // the old one raced the poll loop over a shared status object, so the popup
+    // and the loop could each overwrite the other's verdict and the UI flapped.
+    await syncBridgeClient();
+    return { ok: true, status: TranslationBridgeClient.getStatus() };
+  }
+
+  if (message.action === "RECONNECT_BRIDGE") {
+    return { ok: true, status: TranslationBridgeClient.reconnect() };
   }
 
   if (message.action === "GET_QUEUE_STATUS") {
@@ -249,75 +298,59 @@ async function initializeExtension() {
   await ensureSettings();
   await clearStaleProcessingState();
   await syncAnkiQueueState({ suppressErrors: true });
+  await TranslationBridgeClient.restoreStatus();
   await syncBridgeClient().catch((error) => {
     console.warn("Could not synchronize translation bridge:", error);
   });
   await syncProviderVisibilityShim().catch((error) => {
     console.warn("Could not register the provider visibility shim:", error);
   });
+  await sweepOrphanedProviderTabs();
+}
+
+// A worker killed mid-capture never reaches the `finally` that closes its
+// provider tab, so a stray translate.google.com/deepl.com tab can survive the
+// restart. The automation records the tabs it owns, so only ours get closed —
+// a provider tab the user opened themselves is left alone.
+async function sweepOrphanedProviderTabs() {
+  try {
+    await WonderTranslationAutomation.closeOwnedTabs();
+  } catch (error) {
+    console.warn("Could not sweep orphaned provider tabs:", error);
+  }
 }
 
 // Registers the MAIN-world shim on every provider page we have permission for.
 // Without it Chrome suspends requestAnimationFrame in the background tab we
-// translate in, the provider never renders its result, and the capture times
-// out until the user focuses the tab. Registration follows the granted host
-// permissions, so it re-syncs whenever the user grants or revokes one.
+// translate in, Google never renders its result, and the capture times out. The
+// registration itself lives in translation/provider-shim.js, which also
+// re-asserts it before every capture and repairs it if it did not take.
 async function syncProviderVisibilityShim() {
-  const matches = [];
-
-  for (const provider of KNOWN_TRANSLATION_PROVIDERS) {
-    const granted = await chrome.permissions.contains({
-      origins: [provider.hostPermission],
-    });
-
-    if (granted) {
-      matches.push(provider.hostPermission);
-    }
-  }
-
-  const [existing] = await chrome.scripting
-    .getRegisteredContentScripts({ ids: [PROVIDER_VISIBILITY_SHIM_ID] })
-    .catch(() => []);
-
-  if (!matches.length) {
-    if (existing) {
-      await chrome.scripting.unregisterContentScripts({
-        ids: [PROVIDER_VISIBILITY_SHIM_ID],
-      });
-    }
-
-    return;
-  }
-
-  const script = {
-    id: PROVIDER_VISIBILITY_SHIM_ID,
-    js: ["translation/page-visibility-shim.js"],
-    matches,
-    runAt: "document_start",
-    world: "MAIN",
-    persistAcrossSessions: true,
-  };
-
-  if (existing) {
-    await chrome.scripting.updateContentScripts([script]);
-    return;
-  }
-
-  await chrome.scripting.registerContentScripts([script]);
+  await ProviderVisibilityShim.sync();
 }
 
 // Starts the App-Support translation bridge client when the extension is in
-// app-support mode, and stops it otherwise. Safe to call repeatedly.
+// app-support mode, and stops it otherwise. Called on every worker start and
+// every watchdog tick, so it must be a cheap no-op when already connected.
 async function syncBridgeClient() {
   const appMode = await getAppMode();
   const translationSettings = await getTranslationSettings();
 
-  if (appMode === "app-support") {
-    TranslationBridgeClient.start({
-      endpoint: translationSettings.bridgeEndpoint,
-    });
-  } else {
+  if (appMode !== "app-support") {
     TranslationBridgeClient.stop();
+    await chrome.alarms.clear(BRIDGE_WATCHDOG_ALARM);
+    return;
+  }
+
+  TranslationBridgeClient.start({
+    endpoint: translationSettings.bridgeEndpoint,
+  });
+
+  const existing = await chrome.alarms.get(BRIDGE_WATCHDOG_ALARM);
+  if (!existing) {
+    await chrome.alarms.create(BRIDGE_WATCHDOG_ALARM, {
+      periodInMinutes: BRIDGE_WATCHDOG_PERIOD_MINUTES,
+    });
   }
 }
 
@@ -505,6 +538,7 @@ async function handleRecordingComplete(message) {
   const recorderState = await getRecorderState();
   const transcriptionSettings = await getTranscriptionSettings();
   const translationSettings = await getTranslationSettings();
+  const ankiSettings = await getAnkiSettings();
   const outputDirectory = await getOutputDirectory();
   const durationMs = message.durationMs || 0;
   const primaryBlob = await getRecordingBlob(message.blobId);
@@ -595,6 +629,7 @@ async function handleRecordingComplete(message) {
         language: transcriptionSettings.language,
         recordingName: getFileStem(audioPath),
         ankiDeckName: transcriptionSettings.ankiDeckName,
+        ankiSettings,
         ankiEnabled: !translationSettings.enabled,
       });
 
@@ -627,6 +662,10 @@ async function handleRecordingComplete(message) {
         const translationResult = await TranslationService.capture(
           translationSettings.provider,
           transcriptText,
+          {
+            sourceLang: transcriptionSettings.language,
+            targetLang: translationSettings.targetLanguage,
+          },
         );
         translatedText = translationResult.translatedText;
         translationError = translationResult.errorText;
@@ -639,6 +678,7 @@ async function handleRecordingComplete(message) {
         translatedText,
         recordingName: getFileStem(audioPath),
         ankiDeckName: transcriptionSettings.ankiDeckName,
+        ankiSettings,
       });
 
       await updateQueueStateFromTranscriptionResult(finalAnkiResult);
@@ -1076,13 +1116,14 @@ async function requestNativePathSelection(options = {}) {
 }
 
 function buildNativeAnkiConfig(options = {}) {
+  const ankiSettings = options.ankiSettings || DEFAULT_ANKI_SETTINGS;
+
   return {
     enabled: options.ankiEnabled !== false,
     connectUrl: ANKI_CONNECT_URL,
     deckName: String(options.ankiDeckName || "").trim(),
-    modelName: ANKI_MODEL_NAME,
-    frontField: ANKI_FRONT_FIELD,
-    backField: ANKI_BACK_FIELD,
+    noteType: ankiSettings.noteType,
+    fields: ankiSettings.fields,
   };
 }
 

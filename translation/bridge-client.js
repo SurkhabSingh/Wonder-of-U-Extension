@@ -1,21 +1,30 @@
 (function initializeTranslationBridgeClient(globalScope) {
   "use strict";
 
-  // Client half of the Wonder of U translation bridge. In App-Support mode the
-  // extension connects OUT to a consumer that hosts the loopback server (the
-  // desktop app, or the Anki add-on). See translation/BRIDGE.md for the
-  // contract. The extension never hosts a server; it long-polls for jobs,
-  // performs provider-specific browser automation, and posts results back.
+  // Client half of the Wonder of U translation bridge. See translation/BRIDGE.md.
+  //
+  // The extension used to long-poll the desktop app over HTTP from this service
+  // worker. That could not be made reliable: Chrome terminates an MV3 service
+  // worker after 30 seconds of inactivity, and an in-flight `fetch()` is neither
+  // an event nor an extension API call, so it does not reset that timer. While
+  // the user was browsing, unrelated events kept the worker alive by accident;
+  // minimize the window and the worker died mid-poll, taking the connection (and
+  // any claimed job) with it.
+  //
+  // So the HTTP now lives in the native host, and we talk to it over a
+  // `connectNative` port — the one long-lived connection Chrome documents as
+  // keeping a service worker alive, cancelling both the idle timeout and the
+  // 5-minute cap. The worker keeps only the part that actually needs a browser:
+  // driving the provider page.
 
-  const PROTOCOL_VERSION = "1";
-  const HEALTH_TIMEOUT_MS = 4000;
-  const LONG_POLL_WAIT_SECONDS = 25;
-  const LONG_POLL_TIMEOUT_MS = 35000;
-  const RESULT_TIMEOUT_MS = 10000;
-  const RECONNECT_DELAY_MS = 3000;
+  const NATIVE_BRIDGE_HOST = "com.audio_recorder.whisper_host";
+  const MIN_RECONNECT_DELAY_MS = 1000;
+  const MAX_RECONNECT_DELAY_MS = 30000;
 
+  let port = null;
   let running = false;
-  let loopToken = 0;
+  let reconnectFailures = 0;
+  let reconnectTimer = null;
   let endpoint = DEFAULT_BRIDGE_ENDPOINT;
 
   const status = {
@@ -27,112 +36,198 @@
     lastJobAt: null,
   };
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  // The popup must be able to tell "the app is not running" from "the worker was
+  // restarted a moment ago and has not reconnected yet". In-memory state cannot:
+  // it dies with the worker. Session storage survives the restart and is cleared
+  // when the browser closes, which is exactly the lifetime we want.
+  function persistStatus() {
+    return chrome.storage.session
+      .set({ bridgeStatus: { ...status } })
+      .catch(() => {});
   }
 
-  function configure(options = {}) {
-    if (options.endpoint) {
-      endpoint = sanitizeBridgeEndpoint(options.endpoint);
-      status.endpoint = endpoint;
-    }
+  function setStatus(patch) {
+    Object.assign(status, patch);
+    return persistStatus();
   }
 
   function getStatus() {
     return { ...status, endpoint };
   }
 
-  async function fetchWithTimeout(path, options = {}, timeoutMs = HEALTH_TIMEOUT_MS) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  async function restoreStatus() {
+    try {
+      const stored = await chrome.storage.session.get("bridgeStatus");
+      if (stored?.bridgeStatus) {
+        Object.assign(status, stored.bridgeStatus, {
+          running,
+          connected: false,
+        });
+      }
+    } catch {
+      // Session storage is unavailable; the live port will repopulate status.
+    }
+  }
+
+  function configure(options = {}) {
+    if (!options.endpoint) {
+      return false;
+    }
+
+    const sanitized = sanitizeBridgeEndpoint(options.endpoint);
+    const changed = sanitized !== endpoint;
+    endpoint = sanitized;
+    status.endpoint = sanitized;
+
+    return changed;
+  }
+
+  function start(options = {}) {
+    const endpointChanged = configure(options);
+
+    if (running && !endpointChanged) {
+      // Already connected (or mid-reconnect) against the same host. The alarm
+      // watchdog calls this every 30s, so it has to be a cheap no-op.
+      ensurePort();
+      return;
+    }
+
+    if (endpointChanged && running) {
+      teardownPort();
+    }
+
+    running = true;
+    status.running = true;
+    ensurePort();
+  }
+
+  function stop() {
+    running = false;
+    status.running = false;
+    reconnectFailures = 0;
+    teardownPort();
+    setStatus({ connected: false, version: "", lastError: "" });
+  }
+
+  function teardownPort() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+
+    if (!port) {
+      return;
+    }
+
+    const closing = port;
+    port = null;
 
     try {
-      return await fetch(`${endpoint}${path}`, {
-        ...options,
-        signal: controller.signal,
+      closing.postMessage({ type: "bridge-stop" });
+    } catch {
+      // The port is already gone.
+    }
+
+    try {
+      closing.disconnect();
+    } catch {
+      // Already disconnected.
+    }
+  }
+
+  function ensurePort() {
+    if (port || !running) {
+      return;
+    }
+
+    try {
+      port = chrome.runtime.connectNative(NATIVE_BRIDGE_HOST);
+    } catch (error) {
+      port = null;
+      setStatus({
+        connected: false,
+        lastError: describeNativeHostError(error),
       });
-    } finally {
-      clearTimeout(timeoutId);
+      scheduleReconnect();
+      return;
+    }
+
+    port.onMessage.addListener(handlePortMessage);
+    port.onDisconnect.addListener(handleDisconnect);
+
+    try {
+      port.postMessage({ type: "bridge-start", endpoint });
+    } catch (error) {
+      handleDisconnect();
     }
   }
 
-  // A loopback port can be held by anything — Anki sits on 8765/8766 right next
-  // to us. Confirm whoever answered actually speaks our contract, so a stranger
-  // on the port reads as "not the app" rather than a bare, puzzling HTTP status.
-  async function probeHealth() {
-    const response = await fetchWithTimeout("/v1/health", { method: "GET" });
-    if (!response.ok) {
-      throw new Error(
-        `${endpoint} is in use by another program (status ${response.status}). The Wonder of U app is not listening there.`,
-      );
+  function handleDisconnect() {
+    const failure = chrome.runtime.lastError;
+    port = null;
+
+    if (!running) {
+      return;
     }
 
-    const payload = await response.json().catch(() => ({}));
-    const protocol = String(payload?.protocol || "");
+    setStatus({
+      connected: false,
+      version: "",
+      lastError: failure
+        ? describeNativeHostError(failure)
+        : "The Wonder of U helper stopped. Reconnecting...",
+    });
 
-    if (protocol !== PROTOCOL_VERSION) {
-      throw new Error(
-        protocol
-          ? `${endpoint} speaks bridge protocol ${protocol}, but this extension needs ${PROTOCOL_VERSION}.`
-          : `${endpoint} answered, but it is not a Wonder of U bridge host.`,
-      );
-    }
-
-    return {
-      version: String(payload?.version || ""),
-      protocol,
-    };
+    scheduleReconnect();
   }
 
-  async function claimNextJob() {
-    const response = await fetchWithTimeout(
-      `/v1/translation/next?wait=${LONG_POLL_WAIT_SECONDS}`,
-      { method: "GET" },
-      LONG_POLL_TIMEOUT_MS,
+  function scheduleReconnect() {
+    if (!running || reconnectTimer !== null) {
+      return;
+    }
+
+    reconnectFailures += 1;
+    const capped = Math.min(
+      MAX_RECONNECT_DELAY_MS,
+      MIN_RECONNECT_DELAY_MS * 2 ** (reconnectFailures - 1),
     );
+    const delay = Math.round(capped / 2 + Math.random() * (capped / 2));
 
-    if (response.status === 204) {
-      return null;
-    }
-
-    if (!response.ok) {
-      throw new Error(`Bridge host returned status ${response.status}.`);
-    }
-
-    const job = await response.json().catch(() => null);
-    if (!job?.id || typeof job.sourceText !== "string") {
-      return null;
-    }
-
-    return job;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      ensurePort();
+    }, delay);
   }
 
-  async function completeJob(jobId, translatedText) {
-    await fetchWithTimeout(
-      `/v1/translation/jobs/${encodeURIComponent(jobId)}/complete`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ translatedText: String(translatedText || "") }),
-      },
-      RESULT_TIMEOUT_MS,
-    );
-  }
+  function handlePortMessage(message) {
+    if (message?.type === "bridge-status") {
+      if (message.connected) {
+        reconnectFailures = 0;
+      }
 
-  async function failJob(jobId, errorText) {
-    await fetchWithTimeout(
-      `/v1/translation/jobs/${encodeURIComponent(jobId)}/fail`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ error: String(errorText || "Translation failed.") }),
-      },
-      RESULT_TIMEOUT_MS,
-    ).catch(() => {});
+      setStatus({
+        connected: Boolean(message.connected),
+        version: String(message.version || ""),
+        lastError: String(message.lastError || ""),
+      });
+      return;
+    }
+
+    if (message?.type === "bridge-heartbeat") {
+      // Receiving this resets the service worker's idle timer, which is the
+      // point. Persisting keeps the popup's view fresh across a restart.
+      persistStatus();
+      return;
+    }
+
+    if (message?.type === "bridge-job" && message.job) {
+      handleJob(message.job);
+    }
   }
 
   async function handleJob(job) {
     let providerId = String(job.provider || "").trim();
+
     if (!providerId) {
       const settings = await getTranslationSettings();
       providerId = settings.provider;
@@ -142,95 +237,87 @@
       const result = await globalScope.TranslationService.capture(
         providerId,
         job.sourceText,
+        {
+          sourceLang: job.sourceLang,
+          targetLang: job.targetLang,
+        },
       );
 
       if (result.translatedText) {
-        await completeJob(job.id, result.translatedText);
-        status.lastJobAt = Date.now();
-      } else {
-        await failJob(
-          job.id,
-          result.errorText || "The provider returned no translation.",
-        );
+        postToPort({
+          type: "bridge-result",
+          id: job.id,
+          translatedText: result.translatedText,
+        });
+        await setStatus({ lastJobAt: Date.now() });
+        return;
       }
+
+      postToPort({
+        type: "bridge-fail",
+        id: job.id,
+        error: result.errorText || "The provider returned no translation.",
+      });
     } catch (error) {
-      await failJob(job.id, error?.message || "Translation job failed.");
+      postToPort({
+        type: "bridge-fail",
+        id: job.id,
+        error: error?.message || "Translation job failed.",
+      });
     }
   }
 
-  async function loop(token) {
-    while (running && token === loopToken) {
-      try {
-        const health = await probeHealth();
-        status.connected = true;
-        status.version = health.version;
-        status.lastError = "";
-
-        while (running && token === loopToken) {
-          const job = await claimNextJob();
-          if (!running || token !== loopToken) {
-            return;
-          }
-          if (job) {
-            await handleJob(job);
-          }
-        }
-      } catch (error) {
-        status.connected = false;
-        status.lastError = String(
-          error?.message || error || "Bridge host is unreachable.",
-        );
-        if (!running || token !== loopToken) {
-          return;
-        }
-        await sleep(RECONNECT_DELAY_MS);
-      }
-    }
-  }
-
-  function start(options = {}) {
-    configure(options);
-    if (running) {
+  function postToPort(message) {
+    if (!port) {
       return;
     }
 
-    running = true;
-    status.running = true;
-    loopToken += 1;
-    loop(loopToken);
-  }
-
-  function stop() {
-    running = false;
-    loopToken += 1;
-    status.running = false;
-    status.connected = false;
-  }
-
-  // One-shot health probe for the popup, independent of the running loop.
-  async function checkHealth(options = {}) {
-    configure(options);
     try {
-      const health = await probeHealth();
-      status.connected = true;
-      status.version = health.version;
-      status.lastError = "";
-    } catch (error) {
-      status.connected = false;
-      status.lastError = String(
-        error?.message || error || "Bridge host is unreachable.",
-      );
+      port.postMessage(message);
+    } catch {
+      // The port died while we were translating. The native host times the job
+      // out and reports it back to the app, so nothing is left hanging.
     }
+  }
+
+  function describeNativeHostError(error) {
+    const message = String(error?.message || error || "");
+
+    if (
+      message.includes("native messaging host not found") ||
+      message.includes("Specified native messaging host not found")
+    ) {
+      return "Wonder of U helper is not installed. Run install-native-host.ps1 with your extension ID, then reload the extension.";
+    }
+
+    if (message.includes("forbidden")) {
+      return "The Wonder of U helper does not allow this extension ID. Re-run install-native-host.ps1.";
+    }
+
+    return message || "The Wonder of U helper could not be reached.";
+  }
+
+  // Used by the popup's Reconnect button: drop the port and rebuild it now,
+  // rather than waiting out the backoff.
+  function reconnect() {
+    if (!running) {
+      return getStatus();
+    }
+
+    teardownPort();
+    reconnectFailures = 0;
+    ensurePort();
 
     return getStatus();
   }
 
   globalScope.TranslationBridgeClient = Object.freeze({
-    protocolVersion: PROTOCOL_VERSION,
+    protocolVersion: "1",
     configure,
     start,
     stop,
     getStatus,
-    checkHealth,
+    restoreStatus,
+    reconnect,
   });
 })(self);
