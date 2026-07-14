@@ -5,44 +5,191 @@
     <title>Tab Audio Recorder</title>
     <style>
       :root {
-        --bg: #f7efe5;
-        --panel: rgba(255, 255, 255, 0.74);
-        --panel-border: rgba(102, 71, 58, 0.12);
-        --text: #2c1e18;
-        --muted: #6f5449;
-        --accent: #bb4d2f;
-        --accent-strong: #8f361d;
-        --success: #22694f;
-        --warning: #8c5608;
-        --danger: #8f261f;
+        color-scheme: light dark;
+
+        /* Surfaces */
+        --canvas: #f3f3f5;
+        --surface: #ffffff;
+        --surface-raised: #f8f8f9;
+        --surface-active: #eeeef1;
+        --surface-input: #ffffff;
+
+        /* Ink */
+        --text: #17171a;
+        --text-strong: #0c0c0e;
+        --text-muted: #68686f;
+        --text-subtle: #8a8a92;
+
+        /* Lines */
+        --border: #dedee3;
+        --border-strong: #c9c9d0;
+
+        /* Primary (ink) + single blue accent */
+        --primary: #17171a;
+        --on-primary: #ffffff;
+        --accent: #2878d0;
+        --accent-soft: rgba(40, 120, 208, 0.1);
+        --focus: rgba(40, 120, 208, 0.26);
+
+        /* Status */
+        --success: #18794e;
+        --success-soft: rgba(24, 121, 78, 0.09);
+        --warning: #9a5b13;
+        --warning-soft: rgba(154, 91, 19, 0.1);
+        --error: #c23b3b;
+        --error-soft: rgba(194, 59, 59, 0.09);
+        --recording: #d4572b;
+
+        /* Corner radii */
+        --radius-sm: 6px;
+        --radius-md: 8px;
+        --radius-lg: 10px;
+        --radius-xl: 12px;
+        --radius-pill: 999px;
+
+        /* Weights (the app's own 550/650 habit) */
+        --weight-mid: 550;
+        --weight-semibold: 600;
+        --weight-bold: 650;
+
+        /* Motion */
+        --dur-fast: 120ms;
+        --dur-medium: 180ms;
+        --ease-standard: ease;
+
+        /* Type */
+        --font-sans: Inter, "Segoe UI Variable", "Segoe UI", sans-serif;
+        --font-mono: "Cascadia Code", "SFMono-Regular", Consolas,
+          "Liberation Mono", Menlo, monospace;
+
+        color: var(--text);
+        background: var(--canvas);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --canvas: #090a0b;
+          --surface: #101112;
+          --surface-raised: #151617;
+          --surface-active: #1c1d1f;
+          --surface-input: #0d0e0f;
+          --text: #d7d7da;
+          --text-strong: #f4f4f6;
+          --text-muted: #9c9ca3;
+          --text-subtle: #707077;
+          --border: #28292c;
+          --border-strong: #393a3f;
+          --primary: #f4f4f6;
+          --on-primary: #111214;
+          --accent: #66b5ff;
+          --accent-soft: rgba(102, 181, 255, 0.13);
+          --focus: rgba(102, 181, 255, 0.28);
+          --success: #65cf99;
+          --success-soft: rgba(101, 207, 153, 0.11);
+          --warning: #e7ad62;
+          --warning-soft: rgba(231, 173, 98, 0.12);
+          --error: #ff8585;
+          --error-soft: rgba(255, 133, 133, 0.12);
+          --recording: #ff8a5f;
+        }
       }
 
       * {
         box-sizing: border-box;
       }
 
+      /* Load-bearing: makes every JS `.hidden` toggle authoritative over any
+         class-level `display` (e.g. .mode-bar / .pill / .mode-chooser). */
+      [hidden] {
+        display: none !important;
+      }
+
       body {
         width: 380px;
         margin: 0;
         padding: 16px;
-        font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+        background: var(--canvas);
         color: var(--text);
-        background:
-          radial-gradient(
-            circle at top right,
-            rgba(255, 215, 170, 0.95),
-            transparent 38%
-          ),
-          linear-gradient(160deg, #fff8f0 0%, var(--bg) 55%, #f0dfcf 100%);
+        font-family: var(--font-sans);
+        font-feature-settings: "calt", "kern", "liga", "ss03";
+        line-height: 1.5;
+      }
+
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+
+      /* Base control = ink primary (mirrors the desktop button system). */
+      button {
+        min-height: 36px;
+        padding: 7px 13px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--primary);
+        color: var(--on-primary);
+        font-size: 13px;
+        font-weight: var(--weight-semibold);
+        cursor: pointer;
+        transition:
+          background var(--dur-fast) var(--ease-standard),
+          border-color var(--dur-fast) var(--ease-standard),
+          color var(--dur-fast) var(--ease-standard),
+          opacity var(--dur-fast) var(--ease-standard);
+      }
+
+      button:hover:not(:disabled) {
+        border-color: var(--border-strong);
+        opacity: 0.92;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.42;
+      }
+
+      /* Secondary (flat, raised) variant. */
+      #stop,
+      #startAvTest,
+      #pushQueue,
+      #reconnectBridge,
+      .browse-button {
+        background: var(--surface-raised);
+        color: var(--text-strong);
+      }
+
+      input,
+      select {
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+        min-height: 36px;
+        padding: 7px 10px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--surface-input);
+        color: var(--text);
+        font-size: 13px;
+      }
+
+      input::placeholder {
+        color: var(--text-subtle);
+      }
+
+      button:focus-visible,
+      input:focus-visible,
+      select:focus-visible {
+        outline: 3px solid var(--focus);
+        outline-offset: 1px;
+        border-color: var(--accent);
       }
 
       .shell {
-        border: 1px solid var(--panel-border);
-        border-radius: 20px;
         padding: 16px;
-        background: var(--panel);
-        backdrop-filter: blur(10px);
-        box-shadow: 0 18px 40px rgba(82, 49, 36, 0.14);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-xl);
+        background: var(--surface);
       }
 
       .header {
@@ -54,69 +201,163 @@
 
       .title {
         margin: 0;
+        color: var(--text-strong);
         font-size: 18px;
-        letter-spacing: 0.02em;
+        font-weight: var(--weight-bold);
+        letter-spacing: -0.01em;
       }
 
       .subtitle {
         margin: 4px 0 0;
+        color: var(--text-muted);
         font-size: 12px;
-        color: var(--muted);
+        line-height: 1.45;
+      }
+
+      .header-status {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 6px;
       }
 
       .pill {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        min-width: 74px;
-        padding: 6px 10px;
-        border-radius: 999px;
-        background: rgba(44, 30, 24, 0.08);
-        color: var(--muted);
+        min-height: 28px;
+        padding: 3px 8px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        background: var(--surface-raised);
+        color: var(--text-muted);
         font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.08em;
+        font-weight: var(--weight-semibold);
+        letter-spacing: 0.06em;
         text-transform: uppercase;
       }
 
       .pill.recording {
-        color: #fff7f5;
-        background: linear-gradient(
-          135deg,
-          var(--accent) 0%,
-          var(--accent-strong) 100%
-        );
+        border-color: color-mix(in srgb, var(--recording) 40%, var(--border));
+        background: var(--error-soft);
+        color: var(--recording);
       }
 
       .pill.processing {
-        color: #fff4db;
-        background: linear-gradient(135deg, #b87009 0%, var(--warning) 100%);
+        border-color: color-mix(in srgb, var(--warning) 40%, var(--border));
+        background: var(--warning-soft);
+        color: var(--warning);
+      }
+
+      /* Sits under the state pill in the header as a compact chip. */
+      .mode-bar {
+        display: inline-flex;
+        gap: 8px;
+        align-items: center;
+        padding: 4px 10px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-pill);
+        background: var(--surface-raised);
+        color: var(--text-muted);
+        font-size: 11px;
+        line-height: 1.6;
+        white-space: nowrap;
+      }
+
+      .mode-bar strong {
+        color: var(--text-strong);
+        font-weight: var(--weight-bold);
+      }
+
+      .mode-bar .link-button {
+        font-size: 11px;
+      }
+
+      .link-button {
+        min-height: auto;
+        padding: 0;
+        margin: 0;
+        border: 0;
+        border-radius: 0;
+        background: none;
+        color: var(--accent);
+        font: inherit;
+        font-weight: var(--weight-semibold);
+        cursor: pointer;
+        text-decoration: none;
+        transition: color var(--dur-fast) var(--ease-standard);
+      }
+
+      .link-button:hover:not(:disabled) {
+        border-color: transparent;
+        background: none;
+        opacity: 1;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
+
+      .mode-chooser {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .mode-card {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-height: auto;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        background: var(--surface-raised);
+        color: var(--text);
+        text-align: left;
+      }
+
+      .mode-card:hover:not(:disabled) {
+        border-color: var(--border-strong);
+        background: var(--surface-active);
+        opacity: 1;
+      }
+
+      .mode-card-title {
+        color: var(--text-strong);
+        font-size: 14px;
+        font-weight: var(--weight-bold);
+      }
+
+      .mode-card-desc {
+        color: var(--text-muted);
+        font-size: 12px;
+        font-weight: 400;
+        line-height: 1.45;
       }
 
       .timer-card {
         margin-top: 16px;
-        padding: 14px 16px;
-        border-radius: 18px;
-        background: linear-gradient(
-          145deg,
-          rgba(44, 30, 24, 0.95),
-          rgba(69, 46, 37, 0.88)
-        );
-        color: #fffaf4;
+        padding: 12px 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        background: var(--surface-raised);
       }
 
       .timer-label {
-        font-size: 11px;
-        letter-spacing: 0.14em;
+        color: var(--text-subtle);
+        font-size: 10px;
+        font-weight: var(--weight-bold);
+        letter-spacing: 0.1em;
         text-transform: uppercase;
-        color: rgba(255, 244, 231, 0.72);
       }
 
       .timer-value {
         margin-top: 8px;
-        font-size: 34px;
-        font-weight: 700;
-        letter-spacing: 0.08em;
+        color: var(--text-strong);
+        font-size: 29px;
+        font-weight: var(--weight-semibold);
+        letter-spacing: -0.02em;
+        line-height: 1;
+        font-variant-numeric: tabular-nums;
       }
 
       .controls {
@@ -126,59 +367,62 @@
         margin-top: 14px;
       }
 
-      button {
-        border: none;
-        border-radius: 14px;
-        padding: 11px 12px;
-        font: inherit;
-        font-weight: 700;
-        cursor: pointer;
-        transition:
-          transform 120ms ease,
-          box-shadow 120ms ease,
-          opacity 120ms ease;
-      }
-
-      button:hover:not(:disabled) {
-        transform: translateY(-1px);
-      }
-
-      button:disabled {
-        cursor: not-allowed;
-        opacity: 0.55;
-      }
-
-      #start {
-        background: linear-gradient(135deg, var(--accent) 0%, #d7653d 100%);
-        color: #fff8f2;
-        box-shadow: 0 10px 22px rgba(187, 77, 47, 0.26);
-      }
-
-      #stop {
-        background: rgba(44, 30, 24, 0.08);
-        color: var(--text);
-      }
-
       .section {
-        margin-top: 14px;
-        padding: 12px 13px;
-        border-radius: 16px;
-        background: rgba(255, 255, 255, 0.62);
-        border: 1px solid rgba(102, 71, 58, 0.1);
+        margin-top: 12px;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        background: var(--surface);
       }
 
       .section-title {
         margin: 0 0 10px;
-        font-size: 12px;
-        font-weight: 700;
-        letter-spacing: 0.08em;
+        color: var(--text-subtle);
+        font-size: 10px;
+        font-weight: var(--weight-bold);
+        letter-spacing: 0.1em;
         text-transform: uppercase;
-        color: var(--muted);
+      }
+
+      /* Temporary A/V tester is collapsed by default so it does not dominate
+         the Solo view height. The summary reads as a flat, tappable header. */
+      .av-test-summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        cursor: pointer;
+        list-style: none;
+      }
+
+      .av-test-summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .av-test-summary::after {
+        content: "+";
+        font-size: 13px;
+        font-weight: var(--weight-bold);
+        color: var(--text-muted);
+      }
+
+      .av-test-section[open] .av-test-summary::after {
+        content: "\2212";
+      }
+
+      .av-test-section:not([open]) .av-test-summary {
+        margin-bottom: 0;
+      }
+
+      .av-test-summary:focus-visible {
+        outline: 3px solid var(--focus);
+        outline-offset: 3px;
+        border-radius: var(--radius-sm);
       }
 
       .field {
-        display: flex;
-        flex-direction: column;
+        min-width: 0;
+        display: grid;
         gap: 6px;
       }
 
@@ -187,19 +431,9 @@
       }
 
       label {
+        color: var(--text-muted);
         font-size: 12px;
-        color: var(--muted);
-      }
-
-      select,
-      input {
-        width: 100%;
-        border: 1px solid rgba(102, 71, 58, 0.16);
-        border-radius: 12px;
-        padding: 10px 12px;
-        font: inherit;
-        color: var(--text);
-        background: rgba(255, 252, 248, 0.96);
+        font-weight: var(--weight-mid);
       }
 
       .path-input-row {
@@ -209,43 +443,52 @@
         align-items: center;
       }
 
+      .path-input-row > input,
+      .path-input-row > select {
+        min-width: 0;
+      }
+
       .browse-button {
-        min-width: 78px;
-        padding: 10px 12px;
-        border: 1px solid rgba(102, 71, 58, 0.16);
-        background: rgba(44, 30, 24, 0.08);
-        color: var(--text);
+        white-space: nowrap;
       }
 
       .toggle {
         display: flex;
+        gap: 9px;
         align-items: center;
-        gap: 10px;
-        font-size: 13px;
-        font-weight: 700;
         color: var(--text);
+        font-size: 13px;
+        font-weight: var(--weight-mid);
       }
 
       .toggle input {
-        width: auto;
+        width: 15px;
+        min-height: 15px;
+        height: 15px;
         margin: 0;
+        padding: 0;
         accent-color: var(--accent);
       }
 
       .hint,
       .hotkeys {
         margin: 8px 0 0;
+        color: var(--text-muted);
         font-size: 11px;
         line-height: 1.45;
-        color: var(--muted);
+      }
+
+      .hint.error {
+        color: var(--error);
       }
 
       code {
-        padding: 1px 4px;
-        border-radius: 6px;
-        background: rgba(44, 30, 24, 0.08);
-        font-family: "Consolas", "Courier New", monospace;
+        padding: 1px 5px;
+        border-radius: var(--radius-sm);
+        background: var(--surface-active);
         color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 11px;
       }
 
       .status {
@@ -259,7 +502,7 @@
       }
 
       .status.error {
-        color: var(--danger);
+        color: var(--error);
       }
 
       .status.recording {
@@ -278,36 +521,34 @@
       }
 
       .queue-card {
-        padding: 12px 13px;
-        border-radius: 14px;
-        background: rgba(44, 30, 24, 0.05);
+        padding: 12px 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        background: var(--surface-raised);
       }
 
       .queue-label {
-        font-size: 11px;
-        letter-spacing: 0.08em;
+        color: var(--text-subtle);
+        font-size: 10px;
+        font-weight: var(--weight-bold);
+        letter-spacing: 0.1em;
         text-transform: uppercase;
-        color: var(--muted);
       }
 
       .queue-count {
         margin-top: 6px;
+        color: var(--text-strong);
         font-size: 26px;
-        font-weight: 700;
-        color: var(--text);
-      }
-
-      #pushQueue {
-        min-width: 122px;
-        background: rgba(44, 30, 24, 0.08);
-        color: var(--text);
+        font-weight: var(--weight-semibold);
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
       }
 
       .queue-list {
-        margin-top: 12px;
         display: flex;
         flex-direction: column;
         gap: 8px;
+        margin-top: 12px;
       }
 
       .queue-item {
@@ -316,14 +557,15 @@
         gap: 8px;
         align-items: center;
         padding: 10px 12px;
-        border-radius: 12px;
-        background: rgba(44, 30, 24, 0.05);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-md);
+        background: var(--surface-raised);
       }
 
       .queue-item-title {
+        color: var(--text-strong);
         font-size: 12px;
-        font-weight: 700;
-        color: var(--text);
+        font-weight: var(--weight-semibold);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -331,117 +573,46 @@
 
       .queue-item-meta {
         margin-top: 4px;
+        color: var(--text-muted);
         font-size: 11px;
         line-height: 1.4;
-        color: var(--muted);
       }
 
       .queue-item-drop {
+        min-height: 32px;
         min-width: 70px;
-        padding: 8px 10px;
-        border: 1px solid rgba(143, 38, 31, 0.14);
-        background: rgba(143, 38, 31, 0.08);
-        color: var(--danger);
+        padding: 6px 10px;
+        border: 1px solid color-mix(in srgb, var(--error) 36%, var(--border));
+        border-radius: var(--radius-sm);
+        background: var(--error-soft);
+        color: var(--error);
+        font-size: 11px;
+      }
+
+      .queue-item-drop:hover:not(:disabled) {
+        border-color: color-mix(in srgb, var(--error) 55%, var(--border));
+        opacity: 0.92;
       }
 
       .queue-empty {
         margin: 0;
+        color: var(--text-muted);
         font-size: 11px;
-        color: var(--muted);
-      }
-
-      .hint.error {
-        color: var(--danger);
-      }
-
-      .header-status {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-end;
-        gap: 6px;
-      }
-
-      /* Sits under the state pill in the header as a compact chip, rather than
-         as a full-width bar between the header and the content. */
-      .mode-bar {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 4px 10px;
-        border-radius: 999px;
-        background: rgba(44, 30, 24, 0.05);
-        font-size: 11px;
-        line-height: 1.6;
-        white-space: nowrap;
-        color: var(--muted);
-      }
-
-      .mode-bar strong {
-        font-weight: 700;
-        color: var(--text);
-      }
-
-      .mode-bar .link-button {
-        font-size: 11px;
-      }
-
-      .link-button {
-        border: none;
-        background: none;
-        padding: 0;
-        margin: 0;
-        font: inherit;
-        font-weight: 700;
-        color: var(--accent);
-        cursor: pointer;
-        text-decoration: underline;
-      }
-
-      .mode-chooser {
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-      }
-
-      .mode-card {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-        text-align: left;
-        padding: 14px 16px;
-        border-radius: 16px;
-        border: 1px solid rgba(102, 71, 58, 0.16);
-        background: rgba(255, 252, 248, 0.96);
-        color: var(--text);
-      }
-
-      .mode-card:hover:not(:disabled) {
-        box-shadow: 0 10px 22px rgba(187, 77, 47, 0.16);
-      }
-
-      .mode-card-title {
-        font-size: 14px;
-        font-weight: 700;
-      }
-
-      .mode-card-desc {
-        font-size: 12px;
-        font-weight: 400;
-        color: var(--muted);
-        line-height: 1.45;
       }
 
       .bridge-card {
         margin-top: 12px;
-        padding: 12px 13px;
-        border-radius: 14px;
-        background: rgba(44, 30, 24, 0.05);
+        padding: 12px 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        background: var(--surface-raised);
       }
 
       .bridge-status {
         margin: 6px 0 0;
+        color: var(--text-muted);
         font-size: 13px;
-        font-weight: 700;
+        font-weight: var(--weight-semibold);
       }
 
       .bridge-status.connected {
@@ -535,8 +706,8 @@
         </div>
       </section>
 
-      <section class="section">
-        <p class="section-title">A/V Capture Test</p>
+      <details class="section av-test-section">
+        <summary class="section-title av-test-summary">A/V Capture Test</summary>
 
         <div class="field">
           <label for="avTestVideoBitrate">Video bitrate</label>
@@ -565,7 +736,7 @@
         <p id="avTestStatus" class="hint">
           Temporary tester for same-stream tab audio and video capture.
         </p>
-      </section>
+      </details>
 
       <section class="section">
         <p class="section-title">Transcription</p>
@@ -617,17 +788,17 @@
             <label for="ankiDeckName">Anki deck</label>
             <div class="path-input-row">
               <select id="ankiDeckName"></select>
+              <input
+                id="ankiDeckNameFallback"
+                type="text"
+                placeholder="Audio Immersion"
+                autocomplete="off"
+                hidden
+              />
               <button id="refreshAnkiDecks" class="browse-button" type="button">
                 Refresh
               </button>
             </div>
-            <input
-              id="ankiDeckNameFallback"
-              type="text"
-              placeholder="Audio Immersion"
-              autocomplete="off"
-              hidden
-            />
             <p id="ankiDeckHint" class="hint" hidden></p>
           </div>
         </div>
