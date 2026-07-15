@@ -22,7 +22,11 @@
   const DEFAULT_TIMING = Object.freeze({
     tabLoadTimeoutMs: 15000,
     pageTimeoutMs: 45000,
-    stableWindowMs: 1200,
+    // How long the translated output must stop changing before we read it. The
+    // MutationObserver already fires on the last DOM change; this is the settle
+    // margin on top. 800ms is a comfortable margin above a typical render while
+    // shaving latency off every translation vs. the old 1200ms.
+    stableWindowMs: 800,
     injectRetryDelayMs: 400,
     // Backstop only. The MutationObserver does the real work; this just gives the
     // stability window a tick to elapse on a page that has gone quiet.
