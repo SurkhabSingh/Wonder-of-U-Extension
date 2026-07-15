@@ -48,7 +48,6 @@ const translationTargetLanguageSelect = document.getElementById(
 const deeplApiKeyInput = document.getElementById("deeplApiKey");
 const saveDeeplApiKeyBtn = document.getElementById("saveDeeplApiKey");
 const deeplApiKeyHint = document.getElementById("deeplApiKeyHint");
-const appSupportProviderSelect = document.getElementById("appSupportProvider");
 const bridgeStatus = document.getElementById("bridgeStatus");
 const reconnectBridgeBtn = document.getElementById("reconnectBridge");
 
@@ -274,10 +273,6 @@ translationProviderSelect.addEventListener("change", async () => {
   await handleProviderChange(translationProviderSelect.value);
 });
 
-appSupportProviderSelect.addEventListener("change", async () => {
-  await handleProviderChange(appSupportProviderSelect.value);
-});
-
 ankiNoteTypeSelect.addEventListener("change", async () => {
   await handleAnkiNoteTypeChange(ankiNoteTypeSelect.value);
 });
@@ -411,7 +406,6 @@ async function initializePopup() {
   await ensureSettings();
 
   populateProviderSelect(translationProviderSelect);
-  populateProviderSelect(appSupportProviderSelect);
 
   const [
     appMode,
@@ -918,9 +912,6 @@ function renderTranslationSettings() {
 
   if (translationProviderSelect) {
     translationProviderSelect.value = currentTranslationSettings.provider;
-  }
-  if (appSupportProviderSelect) {
-    appSupportProviderSelect.value = currentTranslationSettings.provider;
   }
 
   renderTargetLanguageSelect();
