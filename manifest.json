@@ -22,8 +22,12 @@
     "https://api-free.deepl.com/*",
     "https://api.deepl.com/*",
     "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://localhost/*",
+    "<all_urls>"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
   "background": {
     "service_worker": "background.js"
   },
@@ -49,6 +53,12 @@
         "default": "Ctrl+Shift+2"
       },
       "description": "Stop recording"
+    },
+    "auto-sync-subtitles": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+3"
+      },
+      "description": "Auto-sync subtitles to the audio"
     }
   }
 }

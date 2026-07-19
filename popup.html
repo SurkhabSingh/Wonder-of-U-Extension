@@ -736,7 +736,66 @@
         <p id="avTestStatus" class="hint">
           Temporary tester for same-stream tab audio and video capture.
         </p>
+
+        <div class="field">
+          <button id="detectVideos" type="button">Detect video players</button>
+        </div>
+
+        <p class="hint">
+          Temporary tester: scans every frame of the active tab for the video
+          player and whether its clock is readable. Start playback first.
+        </p>
+
+        <pre
+          id="videoDetectReport"
+          class="hint"
+          style="white-space: pre-wrap; overflow-x: auto; margin: 0"
+        ></pre>
       </details>
+
+      <section class="section">
+        <p class="section-title">Watch &amp; Mine (subtitles)</p>
+
+        <div class="field">
+          <label class="toggle">
+            <input id="subtitleEnabled" type="checkbox" />
+            <span>Enable subtitle overlay &amp; mining</span>
+          </label>
+        </div>
+
+        <div id="subtitleFields">
+          <p class="hint">
+            Overlays your subtitles on streaming video and lets you mine lines to
+            Anki. Enabling grants access to all sites (needed to reach the player,
+            which sites load in a cross-origin iframe). Reload the video tab after
+            enabling.
+          </p>
+
+          <div class="field">
+            <label for="jimakuApiKey">Jimaku API key (optional)</label>
+            <input
+              id="jimakuApiKey"
+              type="password"
+              placeholder="Paste your key from jimaku.cc/account"
+              autocomplete="off"
+            />
+            <p class="hint">
+              Lets you fetch Japanese subtitles from Jimaku inside the player. Get
+              a key from your account page at jimaku.cc/account.
+            </p>
+          </div>
+
+          <div class="field">
+            <button id="autoSyncButton" type="button">
+              Auto-sync subtitles to audio
+            </button>
+            <p class="hint">
+              Listens to ~30s of this tab's audio and lines the loaded subtitles up
+              with the speech. You can also press Ctrl+Shift+3 while watching.
+            </p>
+          </div>
+        </div>
+      </section>
 
       <section class="section">
         <p class="section-title">Transcription</p>

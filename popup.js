@@ -11,6 +11,11 @@ const avTestVideoBitrateSelect = document.getElementById("avTestVideoBitrate");
 const avTestAudioBitrateSelect = document.getElementById("avTestAudioBitrate");
 const startAvTestBtn = document.getElementById("startAvTest");
 const avTestStatus = document.getElementById("avTestStatus");
+const detectVideosBtn = document.getElementById("detectVideos");
+const videoDetectReport = document.getElementById("videoDetectReport");
+const subtitleEnabledInput = document.getElementById("subtitleEnabled");
+const jimakuApiKeyInput = document.getElementById("jimakuApiKey");
+const autoSyncButton = document.getElementById("autoSyncButton");
 const transcriptionEnabledInput = document.getElementById("transcriptionEnabled");
 const whisperCliPathInput = document.getElementById("whisperCliPath");
 const whisperModelPathInput = document.getElementById("whisperModelPath");
@@ -69,6 +74,7 @@ let ankiDecks = [];
 let ankiDeckError = "";
 let ankiDecksLoading = false;
 let currentAnkiSettings = DEFAULT_ANKI_SETTINGS;
+let currentSubtitleSettings = DEFAULT_SUBTITLE_SETTINGS;
 let ankiNoteTypes = [];
 let ankiFieldNames = [];
 let ankiCatalogError = "";
@@ -173,6 +179,57 @@ browseOutputDirectoryBtn.addEventListener("click", async () => {
 
 startAvTestBtn.addEventListener("click", async () => {
   await handleAvCaptureTest();
+});
+
+detectVideosBtn.addEventListener("click", async () => {
+  await handleDetectVideos();
+});
+
+subtitleEnabledInput.addEventListener("change", async () => {
+  const enable = subtitleEnabledInput.checked;
+  if (enable) {
+    // The overlay must run inside the player's cross-origin iframe, which only
+    // <all_urls> host access can reach; the same grant also covers the Jimaku /
+    // AniList fetches. Requested from this click gesture.
+    let granted = false;
+    try {
+      granted = await chrome.permissions.request({ origins: ["<all_urls>"] });
+    } catch (_) {
+      granted = false;
+    }
+    if (!granted) {
+      subtitleEnabledInput.checked = false;
+      return;
+    }
+  }
+  await persistSubtitleSettings({ enabled: enable });
+});
+
+jimakuApiKeyInput.addEventListener("input", async () => {
+  await persistSubtitleSettings({ jimakuApiKey: jimakuApiKeyInput.value });
+});
+
+autoSyncButton.addEventListener("click", async () => {
+  if (!currentSubtitleSettings.enabled) {
+    autoSyncButton.textContent = "Enable the feature first";
+    return;
+  }
+  // Clicking a popup button grants the activeTab that tabCapture needs; the
+  // background then captures + analyses and applies the offset on the page.
+  autoSyncButton.disabled = true;
+  autoSyncButton.textContent = "Syncing on the page…";
+  try {
+    const [activeTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    await chrome.runtime.sendMessage({
+      action: "RUN_AUTOSYNC",
+      tabId: activeTab?.id,
+    });
+  } catch (_) {
+    /* the capture runs in the background regardless */
+  }
 });
 
 outputDirectoryInput.addEventListener("change", async () => {
@@ -415,6 +472,7 @@ async function initializePopup() {
     transcriptionSettings,
     translationSettings,
     ankiSettings,
+    subtitleSettings,
     ankiQueueState,
   ] =
     await Promise.all([
@@ -425,6 +483,7 @@ async function initializePopup() {
       getTranscriptionSettings(),
       getTranslationSettings(),
       getAnkiSettings(),
+      getSubtitleSettings(),
       getAnkiQueueState(),
     ]);
 
@@ -436,11 +495,13 @@ async function initializePopup() {
   currentTranscriptionSettings = transcriptionSettings;
   currentTranslationSettings = translationSettings;
   currentAnkiSettings = ankiSettings;
+  currentSubtitleSettings = subtitleSettings;
   currentQueueState = ankiQueueState;
 
   renderTranscriptionSettings();
   renderTranslationSettings();
   renderAnkiSettings();
+  renderSubtitleSettings();
   renderQueueState();
   renderQueueItems();
   renderRecorderState();
@@ -470,6 +531,33 @@ function populateProviderSelect(select) {
 async function persistTranscriptionSettings(partialSettings) {
   currentTranscriptionSettings = await updateTranscriptionSettings(partialSettings);
   renderTranscriptionSettings();
+}
+
+function renderSubtitleSettings() {
+  if (subtitleEnabledInput) {
+    subtitleEnabledInput.checked = Boolean(currentSubtitleSettings.enabled);
+  }
+  // Don't clobber the key while the user is mid-type.
+  if (jimakuApiKeyInput && document.activeElement !== jimakuApiKeyInput) {
+    jimakuApiKeyInput.value = currentSubtitleSettings.jimakuApiKey || "";
+  }
+}
+
+async function persistSubtitleSettings(partialSettings) {
+  // Merge into the in-memory copy SYNCHRONOUSLY first, so two quick saves (e.g.
+  // blurring the key field while flipping the enable toggle) can't read-modify-
+  // write over each other in storage and drop a field. Then persist the full
+  // state. The in-memory copy is the source of truth while the popup is open.
+  currentSubtitleSettings = {
+    ...currentSubtitleSettings,
+    ...partialSettings,
+    fields: {
+      ...currentSubtitleSettings.fields,
+      ...(partialSettings.fields || {}),
+    },
+  };
+  renderSubtitleSettings();
+  await updateSubtitleSettings(currentSubtitleSettings);
 }
 
 async function persistTranslationSettings(partialSettings) {
@@ -579,6 +667,117 @@ async function handleAvCaptureTest() {
     startAvTestBtn.textContent = "Record current tab 5s";
     renderButtons();
   }
+}
+
+// --- Video-detection spike (throwaway) ------------------------------------
+// Asks the background worker to inject a detector into every frame of the
+// active tab and renders the per-frame report here in the popup — never in the
+// page console, so anti-DevTools traps on anime sites never fire.
+async function handleDetectVideos() {
+  detectVideosBtn.disabled = true;
+  const originalLabel = detectVideosBtn.textContent;
+  detectVideosBtn.textContent = "Detecting…";
+  renderVideoReport("Requesting host access, then scanning every frame…");
+
+  try {
+    // The player almost always sits in a CROSS-ORIGIN iframe, which activeTab
+    // does not reach — executeScript only injects into frames the extension has
+    // host access to. Request all-sites access from this click gesture (granted
+    // once, then remembered). This is the mechanism asbplayer relies on.
+    const granted = await chrome.permissions.request({
+      origins: ["<all_urls>"],
+    });
+    if (!granted) {
+      renderVideoReport(
+        "Host access was declined. The player usually lives in a cross-origin iframe that can only be scanned with all-sites access — grant it to run the test.",
+      );
+      return;
+    }
+
+    const [activeTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+
+    const response = await chrome.runtime.sendMessage({
+      action: "DETECT_VIDEOS",
+      tabId: activeTab?.id,
+    });
+
+    if (!response?.ok) {
+      throw new Error(response?.error || "Video detection failed.");
+    }
+
+    renderVideoReport(formatVideoReport(response.frames || []));
+  } catch (error) {
+    renderVideoReport(error.message || "Video detection failed.");
+  } finally {
+    detectVideosBtn.disabled = false;
+    detectVideosBtn.textContent = originalLabel;
+  }
+}
+
+function renderVideoReport(text) {
+  videoDetectReport.textContent = text;
+}
+
+function formatVideoDetectTime(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "—";
+  }
+  return `${value.toFixed(2)}s`;
+}
+
+function formatVideoReport(frames) {
+  if (!frames.length) {
+    return "No frames were reachable — the tab may not be scriptable, or the active-tab grant did not reach any frame.";
+  }
+
+  const lines = [];
+  let advancingCount = 0;
+
+  frames.forEach((frame, index) => {
+    if (frame.error) {
+      lines.push(`✗ frame ${index} — error: ${frame.error}`);
+      lines.push("");
+      return;
+    }
+
+    const where = frame.isTop ? "top" : "iframe";
+    const active = frame.active;
+    let glyph = "✗";
+    if (active) {
+      glyph = active.advanced ? "✓" : "⚠";
+    }
+    if (active && active.advanced) {
+      advancingCount += 1;
+    }
+
+    lines.push(
+      `${glyph} frame ${index} — ${where} · ${frame.origin || "(opaque origin)"}`,
+    );
+    lines.push(
+      `    videos: ${frame.videoCount}${frame.audioCount ? ` · audios: ${frame.audioCount}` : ""}`,
+    );
+
+    if (active) {
+      lines.push(
+        `    currentTime: ${formatVideoDetectTime(active.currentTime)} → ${formatVideoDetectTime(active.currentTimeAfter)} (${active.advanced ? "advancing" : "NOT advancing"})`,
+      );
+      lines.push(
+        `    ${active.videoWidth}×${active.videoHeight}px · readyState ${active.readyState} · ${active.paused ? "paused" : "playing"} · box ${active.rectW}×${active.rectH}`,
+      );
+      if (active.currentSrc) {
+        lines.push(`    src: ${active.currentSrc}`);
+      }
+    } else {
+      lines.push("    no <video> found in this frame");
+    }
+    lines.push("");
+  });
+
+  const header = `${advancingCount > 0 ? "✓" : "✗"} ${advancingCount} frame(s) with an advancing video · ${frames.length} frame(s) reachable`;
+  return `${header}\n\n${lines.join("\n")}`.trim();
 }
 
 function schedulePersistedSetting(key, value) {

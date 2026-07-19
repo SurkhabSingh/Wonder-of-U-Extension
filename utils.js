@@ -62,6 +62,34 @@ const DEFAULT_ANKI_SETTINGS = {
   noteType: DEFAULT_ANKI_NOTE_TYPE,
   fields: { ...DEFAULT_ANKI_FIELD_MAP },
 };
+// Watch & Mine (in-browser subtitle overlay + mining). Its own settings group so
+// it stays independent of the recorder's Anki config: subtitle mining writes a
+// sentence + screenshot + source, which is a different field set from the
+// recorder's audio/transcript card.
+const DEFAULT_SUBTITLE_FONT_SIZE_PX = 28;
+const DEFAULT_SUBTITLE_TEXT_COLOR = "#ffffff";
+const SUBTITLE_ANKI_FIELD_ROLES = [
+  { key: "sentence", label: "Sentence" },
+  { key: "image", label: "Screenshot" },
+  { key: "sourceUrl", label: "Source URL" },
+  { key: "position", label: "Timestamp" },
+];
+const DEFAULT_SUBTITLE_ANKI_FIELD_MAP = {
+  sentence: "",
+  image: "",
+  sourceUrl: "",
+  position: "",
+};
+const DEFAULT_SUBTITLE_SETTINGS = {
+  enabled: false,
+  offsetMs: 0,
+  fontSizePx: DEFAULT_SUBTITLE_FONT_SIZE_PX,
+  textColor: DEFAULT_SUBTITLE_TEXT_COLOR,
+  jimakuApiKey: "",
+  deckName: DEFAULT_ANKI_DECK_NAME,
+  noteType: DEFAULT_ANKI_NOTE_TYPE,
+  fields: { ...DEFAULT_SUBTITLE_ANKI_FIELD_MAP },
+};
 const DEFAULT_ANKI_QUEUE_STATE = {
   pendingCount: 0,
   isSyncing: false,
@@ -210,6 +238,7 @@ async function ensureSettings() {
     "transcriptionSettings",
     "translationSettings",
     "ankiSettings",
+    "subtitleSettings",
     "ankiQueueState",
     "appMode",
   ]);
@@ -276,6 +305,18 @@ async function ensureSettings() {
     JSON.stringify(normalizedAnkiSettings) !== JSON.stringify(data.ankiSettings)
   ) {
     updates.ankiSettings = normalizedAnkiSettings;
+  }
+
+  const normalizedSubtitleSettings = normalizeSubtitleSettings(
+    data.subtitleSettings,
+  );
+
+  if (
+    !data.subtitleSettings ||
+    JSON.stringify(normalizedSubtitleSettings) !==
+      JSON.stringify(data.subtitleSettings)
+  ) {
+    updates.subtitleSettings = normalizedSubtitleSettings;
   }
 
   if (Object.keys(updates).length > 0) {
@@ -454,6 +495,54 @@ function normalizeAnkiSettings(settings) {
   return {
     noteType:
       String(settings?.noteType || "").trim() || DEFAULT_ANKI_NOTE_TYPE,
+    fields,
+  };
+}
+
+async function getSubtitleSettings() {
+  const data = await chrome.storage.local.get("subtitleSettings");
+  return normalizeSubtitleSettings(data.subtitleSettings);
+}
+
+async function updateSubtitleSettings(partialSettings) {
+  const currentSettings = await getSubtitleSettings();
+  const nextSettings = normalizeSubtitleSettings({
+    ...currentSettings,
+    ...(partialSettings || {}),
+    fields: {
+      ...currentSettings.fields,
+      ...(partialSettings?.fields || {}),
+    },
+  });
+
+  await chrome.storage.local.set({ subtitleSettings: nextSettings });
+  return nextSettings;
+}
+
+function normalizeSubtitleSettings(settings) {
+  const fields = {};
+  for (const role of SUBTITLE_ANKI_FIELD_ROLES) {
+    const mapped = settings?.fields?.[role.key];
+    fields[role.key] = typeof mapped === "string" ? mapped.trim() : "";
+  }
+
+  const fontSize = Number(settings?.fontSizePx);
+  const offset = Number(settings?.offsetMs);
+  const color = String(settings?.textColor || "").trim();
+
+  return {
+    enabled: Boolean(settings?.enabled),
+    offsetMs: Number.isFinite(offset) ? offset : 0,
+    fontSizePx:
+      Number.isFinite(fontSize) && fontSize >= 8 && fontSize <= 200
+        ? Math.round(fontSize)
+        : DEFAULT_SUBTITLE_FONT_SIZE_PX,
+    textColor: /^#[0-9a-fA-F]{6}$/.test(color)
+      ? color
+      : DEFAULT_SUBTITLE_TEXT_COLOR,
+    jimakuApiKey: String(settings?.jimakuApiKey || "").trim(),
+    deckName: sanitizeAnkiDeckName(settings?.deckName),
+    noteType: String(settings?.noteType || "").trim() || DEFAULT_ANKI_NOTE_TYPE,
     fields,
   };
 }

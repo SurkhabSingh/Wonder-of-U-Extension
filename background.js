@@ -8,6 +8,7 @@ importScripts(
   "translation/deepl-api-provider.js",
   "translation/translation-service.js",
   "translation/bridge-client.js",
+  "overlay/overlay-shim.js",
 );
 
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
@@ -41,11 +42,19 @@ chrome.permissions.onAdded.addListener(() => {
   syncProviderVisibilityShim().catch((error) => {
     console.warn("Could not register the provider visibility shim:", error);
   });
+  // Granting <all_urls> (from the Watch & Mine toggle) registers the overlay
+  // across all frames the instant the permission lands.
+  syncSubtitleOverlayShim().catch((error) => {
+    console.warn("Could not register the subtitle overlay shim:", error);
+  });
 });
 
 chrome.permissions.onRemoved.addListener(() => {
   syncProviderVisibilityShim().catch((error) => {
     console.warn("Could not update the provider visibility shim:", error);
+  });
+  syncSubtitleOverlayShim().catch((error) => {
+    console.warn("Could not update the subtitle overlay shim:", error);
   });
   // Revoking the loopback permission has to stop the bridge too, or it keeps
   // retrying against a host it is no longer allowed to reach.
@@ -64,7 +73,44 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   });
 });
 
+// The subtitle overlay scopes its cues per tab under this key; the content script
+// builds the same `subtitleCues_<tabId>` key. Clear a tab's cues when it navigates
+// to a new page (a new episode — full load or SPA URL change) or is closed, so a
+// subtitle loaded on one video never bleeds onto the next.
+const SUBTITLE_CUES_KEY_PREFIX = "subtitleCues_";
+
+function clearTabSubtitleCues(tabId) {
+  if (typeof tabId !== "number") {
+    return;
+  }
+  chrome.storage.session
+    .remove(`${SUBTITLE_CUES_KEY_PREFIX}${tabId}`)
+    .catch(() => {});
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url) {
+    clearTabSubtitleCues(tabId);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  clearTabSubtitleCues(tabId);
+});
+
 chrome.commands.onCommand.addListener(async (command) => {
+  if (command === "auto-sync-subtitles") {
+    // A command press grants activeTab for the active tab, which tabCapture needs.
+    const [tab] = await chrome.tabs.query({
+      active: true,
+      lastFocusedWindow: true,
+    });
+    if (tab?.id) {
+      startAutoSyncForTab(tab.id);
+    }
+    return;
+  }
+
   try {
     if (command === "start-recording") {
       await startRecording();
@@ -92,6 +138,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.action === "GET_QUEUE_ITEMS" ||
     message?.action === "DROP_QUEUE_ITEM" ||
     message?.action === "START_AV_TEST" ||
+    message?.action === "DETECT_VIDEOS" ||
+    message?.action === "GET_TAB_ID" ||
+    message?.action === "JIMAKU_SEARCH" ||
+    message?.action === "JIMAKU_FILES" ||
+    message?.action === "JIMAKU_DOWNLOAD" ||
+    message?.action === "RUN_AUTOSYNC" ||
     message?.action === "GET_APP_MODE" ||
     message?.action === "SET_APP_MODE" ||
     message?.action === "GET_BRIDGE_STATUS" ||
@@ -100,7 +152,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.action === "LIST_ANKI_NOTE_TYPES" ||
     message?.action === "LIST_ANKI_FIELDS"
   ) {
-    handleControlMessage(message)
+    handleControlMessage(message, sender)
       .then((response) => sendResponse(response))
       .catch(async (error) => {
         console.error("Control message failed:", error);
@@ -114,6 +166,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
 
     return true;
+  }
+
+  if (message?.type === "autosync-started") {
+    // Relayed from the offscreen doc to the tab, so it can read video.currentTime
+    // at the true capture-start moment. tabId travels in the message so this works
+    // even if the SW was restarted mid-capture.
+    if (message.tabId != null) {
+      chrome.tabs
+        .sendMessage(message.tabId, { type: "autosync-started" })
+        .catch(() => {});
+    }
+    return false;
+  }
+
+  if (message?.type === "autosync-clip") {
+    // The offscreen doc captured a short clip; transcribe it via the native host
+    // and push the timestamped segments to the tab's overlay for text matching.
+    handleAutoSyncClip(message);
+    return false;
+  }
+
+  if (message?.type === "autosync-complete") {
+    // Now only carries capture-stage errors (success arrives as autosync-clip).
+    if (message.tabId != null && message.error) {
+      chrome.tabs
+        .sendMessage(message.tabId, {
+          type: "autosync-error",
+          error: message.error,
+        })
+        .catch(() => {});
+    }
+    return false;
   }
 
   if (message?.type === "recording-complete") {
@@ -134,9 +218,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
-async function handleControlMessage(message) {
+async function handleControlMessage(message, sender) {
   if (!message) {
     return { ok: false, error: "Empty message." };
+  }
+
+  if (message.action === "GET_TAB_ID") {
+    // Content scripts can't read their own tab id; the subtitle overlay needs it
+    // to scope its cues to this tab (so a subtitle loaded on one video doesn't
+    // bleed onto every other tab). The tab title seeds the Jimaku search (the
+    // anime name is on the top page, which the player iframe can't read).
+    return {
+      ok: true,
+      tabId: sender?.tab?.id ?? null,
+      title: sender?.tab?.title ?? "",
+    };
   }
 
   if (message.action === "START") {
@@ -168,6 +264,29 @@ async function handleControlMessage(message) {
       videoBitsPerSecond: message.videoBitsPerSecond,
       audioBitsPerSecond: message.audioBitsPerSecond,
     });
+  }
+
+  if (message.action === "DETECT_VIDEOS") {
+    return runVideoDetection(message.tabId);
+  }
+
+  if (message.action === "JIMAKU_SEARCH") {
+    return jimakuSearch(message);
+  }
+
+  if (message.action === "JIMAKU_FILES") {
+    return jimakuFiles(message);
+  }
+
+  if (message.action === "JIMAKU_DOWNLOAD") {
+    return jimakuDownload(message);
+  }
+
+  if (message.action === "RUN_AUTOSYNC") {
+    // Triggered from the popup, whose click grants the activeTab that tabCapture
+    // requires. Fire-and-forget: the result is pushed to the tab's overlay.
+    startAutoSyncForTab(message.tabId);
+    return { ok: true };
   }
 
   if (message.action === "LIST_ANKI_DECKS") {
@@ -296,6 +415,7 @@ function handleRecorderCompleteEvent(message) {
 
 async function initializeExtension() {
   await ensureSettings();
+  await ensureSessionStorageSharedWithFrames();
   await clearStaleProcessingState();
   await syncAnkiQueueState({ suppressErrors: true });
   await TranslationBridgeClient.restoreStatus();
@@ -305,7 +425,30 @@ async function initializeExtension() {
   await syncProviderVisibilityShim().catch((error) => {
     console.warn("Could not register the provider visibility shim:", error);
   });
+  await syncSubtitleOverlayShim().catch((error) => {
+    console.warn("Could not register the subtitle overlay shim:", error);
+  });
   await sweepOrphanedProviderTabs();
+}
+
+// The subtitle overlay shares parsed cues between frames via chrome.storage.session
+// (a drop on the top page must reach the player iframe's overlay). Session storage
+// is hidden from content scripts by default, so open it to them once at startup.
+async function ensureSessionStorageSharedWithFrames() {
+  try {
+    await chrome.storage.session.setAccessLevel({
+      accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS",
+    });
+  } catch (error) {
+    console.warn("Could not expose session storage to content scripts:", error);
+  }
+}
+
+// Registers the subtitle-mining overlay across all frames while <all_urls> is
+// granted, and unregisters it otherwise. The registration itself lives in
+// overlay/overlay-shim.js.
+async function syncSubtitleOverlayShim() {
+  await SubtitleOverlayShim.sync();
 }
 
 // A worker killed mid-capture never reaches the `finally` that closes its
@@ -1365,6 +1508,337 @@ async function requestRecordingName(tabId) {
   } catch (error) {
     console.warn("Could not prompt for a recording name:", error);
     return "";
+  }
+}
+
+// --- Video-detection spike (throwaway) ------------------------------------
+// De-risks the browser video-mining direction: can we find the active <video>
+// and read a live-advancing currentTime inside whatever (cross-origin) frame it
+// lives in, WITHOUT DevTools (which anti-debug sites trap) and without new
+// permissions? Injects into every frame of the active tab under the activeTab
+// grant and reports back to the popup. Delete this block + its handler + the
+// popup button to remove.
+async function runVideoDetection(tabId) {
+  if (!tabId) {
+    return { ok: false, error: "No active tab to inspect." };
+  }
+
+  try {
+    // One injectionResult per frame the extension could reach. A cross-origin
+    // player frame that is MISSING here (vs. present-but-empty) means activeTab
+    // did not reach it — the signal that the real feature needs broad host
+    // permissions like asbplayer.
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: detectVideosInFrame,
+    });
+
+    const frames = (results || []).map((entry) => ({
+      frameId: entry.frameId,
+      ...(entry.result || {
+        error: "Injection produced no result for this frame.",
+      }),
+    }));
+
+    return { ok: true, frames };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.message || "Video detection failed.",
+    };
+  }
+}
+
+// Runs INSIDE each frame (serialized via toString → must close over nothing:
+// no imports, no background-scope references, only its own inner helpers and
+// the frame's globals). Isolated world: shares the DOM to read currentTime but
+// stays invisible to the page's own scripts.
+async function detectVideosInFrame() {
+  try {
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // Enumerate media across the light DOM and any OPEN shadow roots. Closed
+    // shadow roots are unreachable here — a video hidden in one reports as
+    // "not found", which is itself a valid finding.
+    const media = [];
+    const seen = new Set();
+    const visit = (root) => {
+      let direct = [];
+      try {
+        direct = root.querySelectorAll("video, audio");
+      } catch (_) {
+        direct = [];
+      }
+      for (const el of direct) {
+        if (!seen.has(el)) {
+          seen.add(el);
+          media.push(el);
+        }
+      }
+      let all = [];
+      try {
+        all = root.querySelectorAll("*");
+      } catch (_) {
+        all = [];
+      }
+      for (const el of all) {
+        if (el.shadowRoot) {
+          visit(el.shadowRoot);
+        }
+      }
+    };
+    visit(document);
+
+    const videos = media.filter((el) => el.tagName === "VIDEO");
+
+    // The "active" video: prefer one that is playing and decodable, else the
+    // largest by visible area (skips 0×0 hidden preload elements).
+    const area = (el) => {
+      const rect = el.getBoundingClientRect();
+      return Math.max(0, rect.width) * Math.max(0, rect.height);
+    };
+    let active = videos.find((v) => !v.paused && v.readyState >= 2) || null;
+    if (!active && videos.length) {
+      active = videos.slice().sort((a, b) => area(b) - area(a))[0];
+    }
+
+    let activeInfo = null;
+    let canReadCurrentTime = false;
+    if (active) {
+      const rect = active.getBoundingClientRect();
+      let first = null;
+      let second = null;
+      try {
+        first = active.currentTime;
+        canReadCurrentTime = typeof first === "number";
+      } catch (_) {
+        canReadCurrentTime = false;
+      }
+      // Sample again to prove the clock advances (i.e. it is really playing).
+      await wait(500);
+      try {
+        second = active.currentTime;
+      } catch (_) {
+        second = null;
+      }
+      const advanced =
+        typeof first === "number" && typeof second === "number"
+          ? second > first
+          : null;
+      const src = active.currentSrc || active.src || "";
+      activeInfo = {
+        currentTime: first,
+        currentTimeAfter: second,
+        advanced,
+        duration: active.duration,
+        paused: active.paused,
+        readyState: active.readyState,
+        videoWidth: active.videoWidth,
+        videoHeight: active.videoHeight,
+        currentSrc: src.slice(0, 120),
+        rectW: Math.round(rect.width),
+        rectH: Math.round(rect.height),
+      };
+    }
+
+    return {
+      frameUrl: location.href,
+      isTop: window.top === window,
+      origin: location.origin,
+      videoCount: videos.length,
+      audioCount: media.length - videos.length,
+      canReadCurrentTime,
+      active: activeInfo,
+    };
+  } catch (error) {
+    let frameUrl = "(unknown)";
+    try {
+      frameUrl = location.href;
+    } catch (_) {
+      frameUrl = "(unknown)";
+    }
+    return {
+      error: String(error && error.message ? error.message : error),
+      frameUrl,
+    };
+  }
+}
+// --- end video-detection spike --------------------------------------------
+
+// --- Jimaku subtitle fetch --------------------------------------------------
+// The Jimaku API (https://jimaku.cc/api) is called from the service worker so the
+// granted <all_urls> host access bypasses CORS. The user's key lives in
+// subtitleSettings. Personal-use only; the 25 req/60s limit is surfaced as-is.
+const JIMAKU_API_BASE = "https://jimaku.cc/api";
+
+async function jimakuApiRequest(path) {
+  const settings = await getSubtitleSettings();
+  const key = settings.jimakuApiKey;
+  if (!key) {
+    return {
+      ok: false,
+      error: "Add your Jimaku API key in the extension popup (jimaku.cc/account).",
+    };
+  }
+
+  let response;
+  try {
+    response = await fetch(`${JIMAKU_API_BASE}${path}`, {
+      headers: { Authorization: key },
+    });
+  } catch (_) {
+    return { ok: false, error: "Could not reach Jimaku." };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return { ok: false, error: "Jimaku rejected the API key." };
+  }
+  if (response.status === 429) {
+    return {
+      ok: false,
+      error: "Jimaku rate limit reached — wait a minute and retry.",
+    };
+  }
+  if (!response.ok) {
+    return { ok: false, error: `Jimaku request failed (${response.status}).` };
+  }
+
+  const data = await response.json().catch(() => null);
+  return { ok: true, data };
+}
+
+async function jimakuSearch(message) {
+  const params = new URLSearchParams();
+  if (message.anilistId) {
+    params.set("anilist_id", String(message.anilistId));
+  } else if (message.query && String(message.query).trim()) {
+    params.set("query", String(message.query).trim());
+  } else {
+    return { ok: false, error: "Enter an anime name to search." };
+  }
+
+  const result = await jimakuApiRequest(`/entries/search?${params.toString()}`);
+  if (!result.ok) {
+    return result;
+  }
+  return { ok: true, entries: Array.isArray(result.data) ? result.data : [] };
+}
+
+async function jimakuFiles(message) {
+  if (message.entryId == null) {
+    return { ok: false, error: "Missing entry id." };
+  }
+  const params = new URLSearchParams();
+  if (message.episode) {
+    params.set("episode", String(message.episode));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const result = await jimakuApiRequest(
+    `/entries/${encodeURIComponent(message.entryId)}/files${suffix}`,
+  );
+  if (!result.ok) {
+    return result;
+  }
+  return { ok: true, files: Array.isArray(result.data) ? result.data : [] };
+}
+
+async function jimakuDownload(message) {
+  const url = String(message.url || "");
+  if (!/^https:\/\/jimaku\.cc\//i.test(url)) {
+    return { ok: false, error: "Invalid Jimaku download URL." };
+  }
+  const settings = await getSubtitleSettings();
+  try {
+    const response = await fetch(url, {
+      headers: settings.jimakuApiKey
+        ? { Authorization: settings.jimakuApiKey }
+        : {},
+    });
+    if (!response.ok) {
+      return { ok: false, error: `Download failed (${response.status}).` };
+    }
+    const content = await response.text();
+    return { ok: true, content };
+  } catch (_) {
+    return { ok: false, error: "Could not download the subtitle file." };
+  }
+}
+// --- end Jimaku subtitle fetch ----------------------------------------------
+
+// Runs an analysis-only tab-audio capture for automatic subtitle sync. The offscreen
+// doc returns a WAV clip which handleAutoSyncClip transcribes; the tab's overlay then
+// matches the transcript to the loaded subtitles. Must be called from an
+// activeTab-granting context (popup click or a command) — tabCapture rejects
+// otherwise. Reuses the recorder's offscreen plumbing.
+async function startAutoSyncForTab(tabId) {
+  if (!tabId) {
+    return;
+  }
+  try {
+    const streamId = await chrome.tabCapture.getMediaStreamId({
+      targetTabId: tabId,
+    });
+    // The offscreen doc acks immediately and later pushes autosync-started /
+    // autosync-clip (both carrying tabId), so the SW needn't stay alive for the
+    // whole capture. ~12s is plenty: text matching only needs a couple of
+    // distinctive lines, and a shorter clip transcribes faster.
+    await sendOffscreenMessage({
+      type: "analyze-audio",
+      streamId,
+      tabId,
+      durationMs: 12000,
+    });
+  } catch (error) {
+    chrome.tabs
+      .sendMessage(tabId, {
+        type: "autosync-error",
+        error: error?.message || "Could not capture the tab audio.",
+      })
+      .catch(() => {});
+  }
+}
+
+// Transcribes an auto-sync clip through the native host and pushes the resulting
+// segments to the tab's overlay. Runs detached from the SW message handler so a
+// long whisper run can't block it; the tabId routes the result back even if the
+// worker was recycled meanwhile.
+async function handleAutoSyncClip(message) {
+  const tabId = message.tabId;
+  if (tabId == null) {
+    return;
+  }
+  try {
+    const transcriptionSettings = await getTranscriptionSettings();
+    if (
+      !transcriptionSettings.whisperCliPath ||
+      !transcriptionSettings.whisperModelPath
+    ) {
+      throw new Error(
+        "Set the Whisper path and model in the desktop app first.",
+      );
+    }
+
+    const response = await requestNativeHostMessage({
+      type: "transcribe-clip",
+      wav: message.wavBase64,
+      // Auto-sync targets Japanese immersion (Jimaku subs + Japanese audio), so
+      // pin the language rather than risk auto-detect on a short clip.
+      language: "ja",
+      whisperCliPath: transcriptionSettings.whisperCliPath,
+      whisperModelPath: transcriptionSettings.whisperModelPath,
+    });
+
+    const segments = Array.isArray(response?.segments) ? response.segments : [];
+    chrome.tabs
+      .sendMessage(tabId, { type: "autosync-run", segments })
+      .catch(() => {});
+  } catch (error) {
+    chrome.tabs
+      .sendMessage(tabId, {
+        type: "autosync-error",
+        error: error?.message || "Could not transcribe the audio.",
+      })
+      .catch(() => {});
   }
 }
 
