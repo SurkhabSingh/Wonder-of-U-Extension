@@ -82,6 +82,7 @@ const DEFAULT_SUBTITLE_ANKI_FIELD_MAP = {
 };
 const DEFAULT_SUBTITLE_SETTINGS = {
   enabled: false,
+  enabledHosts: [],
   offsetMs: 0,
   fontSizePx: DEFAULT_SUBTITLE_FONT_SIZE_PX,
   textColor: DEFAULT_SUBTITLE_TEXT_COLOR,
@@ -530,8 +531,20 @@ function normalizeSubtitleSettings(settings) {
   const offset = Number(settings?.offsetMs);
   const color = String(settings?.textColor || "").trim();
 
+  // Per-site allowlist: the overlay only activates on hosts the user opted in.
+  const enabledHosts = Array.isArray(settings?.enabledHosts)
+    ? Array.from(
+        new Set(
+          settings.enabledHosts
+            .map((host) => String(host || "").trim().toLowerCase())
+            .filter(Boolean),
+        ),
+      )
+    : [];
+
   return {
     enabled: Boolean(settings?.enabled),
+    enabledHosts,
     offsetMs: Number.isFinite(offset) ? offset : 0,
     fontSizePx:
       Number.isFinite(fontSize) && fontSize >= 8 && fontSize <= 200

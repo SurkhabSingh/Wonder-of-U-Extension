@@ -14,6 +14,7 @@ const avTestStatus = document.getElementById("avTestStatus");
 const detectVideosBtn = document.getElementById("detectVideos");
 const videoDetectReport = document.getElementById("videoDetectReport");
 const subtitleEnabledInput = document.getElementById("subtitleEnabled");
+const subtitleEnableLabel = document.getElementById("subtitleEnableLabel");
 const jimakuApiKeyInput = document.getElementById("jimakuApiKey");
 const autoSyncButton = document.getElementById("autoSyncButton");
 const transcriptionEnabledInput = document.getElementById("transcriptionEnabled");
@@ -75,6 +76,8 @@ let ankiDeckError = "";
 let ankiDecksLoading = false;
 let currentAnkiSettings = DEFAULT_ANKI_SETTINGS;
 let currentSubtitleSettings = DEFAULT_SUBTITLE_SETTINGS;
+let currentTabId = null; // active tab, for the per-site subtitle toggle
+let currentTabHost = ""; // its host, "" on unsupported pages (chrome://, etc.)
 let ankiNoteTypes = [];
 let ankiFieldNames = [];
 let ankiCatalogError = "";
@@ -187,10 +190,14 @@ detectVideosBtn.addEventListener("click", async () => {
 
 subtitleEnabledInput.addEventListener("change", async () => {
   const enable = subtitleEnabledInput.checked;
+  if (!currentTabHost || currentTabId == null) {
+    subtitleEnabledInput.checked = false;
+    return;
+  }
   if (enable) {
-    // The overlay must run inside the player's cross-origin iframe, which only
-    // <all_urls> host access can reach; the same grant also covers the Jimaku /
-    // AniList fetches. Requested from this click gesture.
+    // The first time any site is enabled, the overlay needs <all_urls> to run
+    // inside the player's cross-origin iframe (the same grant also covers the
+    // Jimaku / AniList fetches). Requested from this click gesture.
     let granted = false;
     try {
       granted = await chrome.permissions.request({ origins: ["<all_urls>"] });
@@ -202,7 +209,28 @@ subtitleEnabledInput.addEventListener("change", async () => {
       return;
     }
   }
-  await persistSubtitleSettings({ enabled: enable });
+  // The background updates the per-site allowlist and notifies the tab live.
+  const response = await chrome.runtime.sendMessage({
+    action: "TOGGLE_SUBTITLE_SITE",
+    tabId: currentTabId,
+    enable,
+  });
+  if (!response || !response.ok) {
+    subtitleEnabledInput.checked = !enable;
+    return;
+  }
+  // Mirror the change into the in-memory allowlist so the popup reflects it.
+  const hosts = new Set(currentSubtitleSettings.enabledHosts || []);
+  if (enable) {
+    hosts.add(currentTabHost);
+  } else {
+    hosts.delete(currentTabHost);
+  }
+  currentSubtitleSettings = {
+    ...currentSubtitleSettings,
+    enabledHosts: Array.from(hosts),
+  };
+  renderSubtitleSettings();
 });
 
 jimakuApiKeyInput.addEventListener("input", async () => {
@@ -210,8 +238,8 @@ jimakuApiKeyInput.addEventListener("input", async () => {
 });
 
 autoSyncButton.addEventListener("click", async () => {
-  if (!currentSubtitleSettings.enabled) {
-    autoSyncButton.textContent = "Enable the feature first";
+  if (!isCurrentSiteEnabled()) {
+    autoSyncButton.textContent = "Turn this site on first";
     return;
   }
   // Clicking a popup button grants the activeTab that tabCapture needs; the
@@ -461,6 +489,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 async function initializePopup() {
   await ensureSettings();
+  await resolveActiveTab();
 
   populateProviderSelect(translationProviderSelect);
 
@@ -533,9 +562,46 @@ async function persistTranscriptionSettings(partialSettings) {
   renderTranscriptionSettings();
 }
 
+function hostFromUrl(url) {
+  try {
+    return new URL(url || "").hostname.toLowerCase();
+  } catch (_) {
+    return "";
+  }
+}
+
+async function resolveActiveTab() {
+  try {
+    const [activeTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    currentTabId = activeTab?.id ?? null;
+    currentTabHost = hostFromUrl(activeTab?.url);
+  } catch (_) {
+    currentTabId = null;
+    currentTabHost = "";
+  }
+}
+
+function isCurrentSiteEnabled() {
+  return (
+    Boolean(currentTabHost) &&
+    Array.isArray(currentSubtitleSettings.enabledHosts) &&
+    currentSubtitleSettings.enabledHosts.includes(currentTabHost)
+  );
+}
+
 function renderSubtitleSettings() {
+  const supported = Boolean(currentTabHost);
   if (subtitleEnabledInput) {
-    subtitleEnabledInput.checked = Boolean(currentSubtitleSettings.enabled);
+    subtitleEnabledInput.checked = isCurrentSiteEnabled();
+    subtitleEnabledInput.disabled = !supported;
+  }
+  if (subtitleEnableLabel) {
+    subtitleEnableLabel.textContent = supported
+      ? `Show subtitles on ${currentTabHost}`
+      : "Open a video site to enable subtitles here";
   }
   // Don't clobber the key while the user is mid-type.
   if (jimakuApiKeyInput && document.activeElement !== jimakuApiKeyInput) {

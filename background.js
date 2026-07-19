@@ -144,6 +144,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.action === "JIMAKU_FILES" ||
     message?.action === "JIMAKU_DOWNLOAD" ||
     message?.action === "RUN_AUTOSYNC" ||
+    message?.action === "TOGGLE_SUBTITLE_SITE" ||
     message?.action === "GET_APP_MODE" ||
     message?.action === "SET_APP_MODE" ||
     message?.action === "GET_BRIDGE_STATUS" ||
@@ -218,6 +219,54 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
+// The Watch & Mine overlay is opt-in per site: it only activates on hosts the user
+// enabled from the popup. These resolve the host from the top-level tab URL and
+// check it against the stored allowlist.
+function subtitleHostFromTab(tab) {
+  try {
+    return new URL(tab?.url || "").hostname.toLowerCase();
+  } catch (_) {
+    return "";
+  }
+}
+
+function isTabSubtitleEnabled(tab, settings) {
+  const host = subtitleHostFromTab(tab);
+  return (
+    Boolean(host) &&
+    Array.isArray(settings?.enabledHosts) &&
+    settings.enabledHosts.includes(host)
+  );
+}
+
+// Adds/removes the tab's host from the allowlist and tells every frame of the tab
+// to activate or tear down live (no reload needed). Returns the resolved state so
+// the popup can reflect it.
+async function toggleSubtitleSite(tabId, enable) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (_) {
+    return { ok: false, error: "Could not read the current tab." };
+  }
+  const host = subtitleHostFromTab(tab);
+  if (!host) {
+    return { ok: false, error: "This page can't have subtitles enabled." };
+  }
+  const settings = await getSubtitleSettings();
+  const hosts = new Set(settings.enabledHosts);
+  if (enable) {
+    hosts.add(host);
+  } else {
+    hosts.delete(host);
+  }
+  await updateSubtitleSettings({ enabledHosts: Array.from(hosts) });
+  chrome.tabs
+    .sendMessage(tabId, { type: "subtitle-active", active: Boolean(enable) })
+    .catch(() => {});
+  return { ok: true, active: Boolean(enable), host };
+}
+
 async function handleControlMessage(message, sender) {
   if (!message) {
     return { ok: false, error: "Empty message." };
@@ -228,10 +277,15 @@ async function handleControlMessage(message, sender) {
     // to scope its cues to this tab (so a subtitle loaded on one video doesn't
     // bleed onto every other tab). The tab title seeds the Jimaku search (the
     // anime name is on the top page, which the player iframe can't read).
+    const subtitleSettings = await getSubtitleSettings();
     return {
       ok: true,
       tabId: sender?.tab?.id ?? null,
       title: sender?.tab?.title ?? "",
+      // Per-site gate: the overlay only activates on hosts the user opted in.
+      // sender.tab.url is the top-level tab URL even for a cross-origin iframe,
+      // so the player iframe correctly activates on the site's host.
+      active: isTabSubtitleEnabled(sender?.tab, subtitleSettings),
     };
   }
 
@@ -287,6 +341,10 @@ async function handleControlMessage(message, sender) {
     // requires. Fire-and-forget: the result is pushed to the tab's overlay.
     startAutoSyncForTab(message.tabId);
     return { ok: true };
+  }
+
+  if (message.action === "TOGGLE_SUBTITLE_SITE") {
+    return toggleSubtitleSite(message.tabId, message.enable);
   }
 
   if (message.action === "LIST_ANKI_DECKS") {

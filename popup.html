@@ -759,16 +759,16 @@
         <div class="field">
           <label class="toggle">
             <input id="subtitleEnabled" type="checkbox" />
-            <span>Enable subtitle overlay &amp; mining</span>
+            <span id="subtitleEnableLabel">Enable subtitles on this site</span>
           </label>
         </div>
 
         <div id="subtitleFields">
           <p class="hint">
-            Overlays your subtitles on streaming video and lets you mine lines to
-            Anki. Enabling grants access to all sites (needed to reach the player,
-            which sites load in a cross-origin iframe). Reload the video tab after
-            enabling.
+            Turn this on for the site you're watching — the subtitle controls appear
+            only there, and the site is remembered for next time. The first time you
+            enable any site, Chrome asks for access to all sites (needed to reach the
+            cross-origin player iframe); reload the tab once after that first grant.
           </p>
 
           <div class="field">
@@ -790,8 +790,8 @@
               Auto-sync subtitles to audio
             </button>
             <p class="hint">
-              Listens to ~30s of this tab's audio and lines the loaded subtitles up
-              with the speech. You can also press Ctrl+Shift+3 while watching.
+              Listens to ~12s of this tab's audio, transcribes it, and matches the
+              lines to your subtitles. You can also press Ctrl+Shift+3 while watching.
             </p>
           </div>
         </div>

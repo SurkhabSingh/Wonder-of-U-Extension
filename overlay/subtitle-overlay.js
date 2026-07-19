@@ -28,7 +28,8 @@
   const DEFAULT_TEXT_COLOR = "#ffffff";
 
   let sessionCuesKey = null; // "subtitleCues_<tabId>", set once the tab id resolves
-  let enabled = false; // gates all behaviour on the Watch & Mine toggle
+  let enabled = false; // gates all behaviour; true only when this site is opted in
+  let siteActive = false; // whether the background says this tab's host is enabled
   let cues = [];
   let offsetMs = 0;
   let fontSizePx = DEFAULT_FONT_SIZE_PX;
@@ -71,6 +72,11 @@
       applyAutoSyncTranscript(message.segments);
     } else if (message.type === "autosync-error") {
       setAutoSyncStatus(message.error || "Auto-sync failed.");
+    } else if (message.type === "subtitle-active") {
+      // The popup toggled this site on/off — activate or tear down live.
+      enabled = Boolean(message.active);
+      siteActive = enabled;
+      applyEnabledState();
     }
   });
 
@@ -1288,9 +1294,9 @@
       applyCues(changes[sessionCuesKey].newValue || []);
     }
     if (area === "local" && changes[SETTINGS_KEY]) {
+      // Appearance only — activation is per-site and arrives via the
+      // "subtitle-active" message, not through this global settings blob.
       const next = changes[SETTINGS_KEY].newValue || {};
-      const wasEnabled = enabled;
-      enabled = Boolean(next.enabled);
       offsetMs = Number(next.offsetMs || 0);
       if (next.fontSizePx) {
         fontSizePx = Number(next.fontSizePx);
@@ -1300,9 +1306,6 @@
       }
       activeIndex = -1;
       syncControls();
-      if (enabled !== wasEnabled) {
-        applyEnabledState(); // toggled on → activate; off → tear down
-      }
     }
   });
 
@@ -1317,6 +1320,9 @@
       if (response && response.title) {
         tabTitle = String(response.title);
       }
+      // The background resolves the tab's top-level host and tells us whether the
+      // user opted this site in — the only thing that activates the overlay.
+      siteActive = Boolean(response && response.active);
     } catch (_) {
       sessionCuesKey = null; // no cross-frame sharing, but the drop frame still renders
     }
@@ -1326,7 +1332,9 @@
     try {
       chrome.storage.local.get(SETTINGS_KEY, (result) => {
         const settings = (result && result[SETTINGS_KEY]) || {};
-        enabled = Boolean(settings.enabled);
+        // Activation is per-site, resolved by the background (see resolveTabId);
+        // storage only carries appearance here.
+        enabled = siteActive;
         offsetMs = Number(settings.offsetMs || 0);
         if (settings.fontSizePx) {
           fontSizePx = Number(settings.fontSizePx);
