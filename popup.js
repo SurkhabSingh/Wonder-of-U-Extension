@@ -16,7 +16,6 @@ const videoDetectReport = document.getElementById("videoDetectReport");
 const subtitleEnabledInput = document.getElementById("subtitleEnabled");
 const subtitleEnableLabel = document.getElementById("subtitleEnableLabel");
 const jimakuApiKeyInput = document.getElementById("jimakuApiKey");
-const autoSyncButton = document.getElementById("autoSyncButton");
 const transcriptionEnabledInput = document.getElementById("transcriptionEnabled");
 const whisperCliPathInput = document.getElementById("whisperCliPath");
 const whisperModelPathInput = document.getElementById("whisperModelPath");
@@ -235,29 +234,6 @@ subtitleEnabledInput.addEventListener("change", async () => {
 
 jimakuApiKeyInput.addEventListener("input", async () => {
   await persistSubtitleSettings({ jimakuApiKey: jimakuApiKeyInput.value });
-});
-
-autoSyncButton.addEventListener("click", async () => {
-  if (!isCurrentSiteEnabled()) {
-    autoSyncButton.textContent = "Turn this site on first";
-    return;
-  }
-  // Clicking a popup button grants the activeTab that tabCapture needs; the
-  // background then captures + analyses and applies the offset on the page.
-  autoSyncButton.disabled = true;
-  autoSyncButton.textContent = "Syncing on the page…";
-  try {
-    const [activeTab] = await chrome.tabs.query({
-      active: true,
-      currentWindow: true,
-    });
-    await chrome.runtime.sendMessage({
-      action: "RUN_AUTOSYNC",
-      tabId: activeTab?.id,
-    });
-  } catch (_) {
-    /* the capture runs in the background regardless */
-  }
 });
 
 outputDirectoryInput.addEventListener("change", async () => {

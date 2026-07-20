@@ -53,12 +53,6 @@
         "default": "Ctrl+Shift+2"
       },
       "description": "Stop recording"
-    },
-    "auto-sync-subtitles": {
-      "suggested_key": {
-        "default": "Ctrl+Shift+3"
-      },
-      "description": "Auto-sync subtitles to the audio"
     }
   }
 }

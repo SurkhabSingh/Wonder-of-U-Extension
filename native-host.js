@@ -143,10 +143,6 @@ async function handleNativeMessage(message) {
     return createStandaloneAnkiCard(message);
   }
 
-  if (message?.type === "transcribe-clip") {
-    return transcribeClip(message);
-  }
-
   if (message?.type !== "process-recording") {
     throw new Error("Unsupported native host request.");
   }
@@ -471,98 +467,6 @@ async function runWhisperTranscription(job) {
   return {
     transcriptPath,
   };
-}
-
-// Transcribes a short in-memory audio clip (base64-encoded 16 kHz mono WAV) into
-// timestamped segments, for the browser's subtitle auto-sync. Unlike
-// process-recording it takes the audio inline (the extension captured it from the
-// tab), writes it to a private temp WAV, runs whisper-cli with --output-json, and
-// returns the parsed segments without touching Anki or any transcript sidecar.
-async function transcribeClip(message) {
-  const whisperCliPath = String(message?.whisperCliPath || "").trim();
-  const whisperModelPath = String(message?.whisperModelPath || "").trim();
-  const language =
-    String(message?.language || "auto").trim().toLowerCase() || "auto";
-  const wavBase64 = String(message?.wav || "");
-
-  if (!whisperCliPath || !path.isAbsolute(whisperCliPath)) {
-    throw new Error("Missing or invalid whisper-cli path.");
-  }
-  if (
-    !ALLOWED_WHISPER_EXECUTABLES.has(path.basename(whisperCliPath).toLowerCase())
-  ) {
-    throw new Error("The configured executable must be whisper-cli.");
-  }
-  if (!whisperModelPath || !path.isAbsolute(whisperModelPath)) {
-    throw new Error("Missing or invalid Whisper model path.");
-  }
-  if (!wavBase64) {
-    throw new Error("No audio clip was provided.");
-  }
-
-  await assertFileExists(whisperCliPath, "whisper-cli was not found.");
-  await assertFileExists(whisperModelPath, "The Whisper model file was not found.");
-
-  const workDir = await fs.promises.mkdtemp(
-    path.join(os.tmpdir(), "wonder-autosync-"),
-  );
-  const audioPath = path.join(workDir, "clip.wav");
-  const outputBase = path.join(workDir, "clip");
-
-  try {
-    await fs.promises.writeFile(audioPath, Buffer.from(wavBase64, "base64"));
-
-    const args = [
-      "--model",
-      whisperModelPath,
-      "--file",
-      audioPath,
-      "--output-file",
-      outputBase,
-      "--output-json",
-    ];
-    if (language !== "auto") {
-      args.push("--language", language);
-    }
-
-    await spawnProcess(whisperCliPath, args);
-    const segments = await readWhisperSegments(`${outputBase}.json`);
-    return { segments };
-  } finally {
-    // Best-effort cleanup; the clip is transient and lives only in the OS temp dir.
-    await fs.promises
-      .rm(workDir, { recursive: true, force: true })
-      .catch(() => {});
-  }
-}
-
-// Maps whisper.cpp's native JSON (a `transcription` array of { text, offsets:
-// { from, to } } in milliseconds) to the same { text, startMs, endMs } shape the
-// desktop app uses, dropping empty lines.
-async function readWhisperSegments(jsonPath) {
-  await assertFileExists(
-    jsonPath,
-    "whisper.cpp finished, but no JSON transcript was created.",
-  );
-
-  const raw = await fs.promises.readFile(jsonPath, "utf8");
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    throw new Error("Could not parse the Whisper JSON output.");
-  }
-
-  const entries = Array.isArray(parsed?.transcription)
-    ? parsed.transcription
-    : [];
-  return entries
-    .map((entry) => ({
-      text: String(entry?.text || "").trim(),
-      startMs: Math.round(Number(entry?.offsets?.from) || 0),
-      endMs: Math.round(Number(entry?.offsets?.to) || 0),
-    }))
-    .filter((segment) => segment.text.length > 0);
 }
 
 async function buildAnkiJob(job, transcriptPath, options = {}) {

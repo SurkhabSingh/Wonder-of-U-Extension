@@ -52,28 +52,14 @@
   let manualDialogEl = null;
   let jimakuDialogEl = null;
   let tabTitle = ""; // top-page title, used to seed the Jimaku search
-  let autosyncAnchorMs = null; // video-time (ms) captured when audio capture starts
 
-  // Auto-sync is driven by the background (popup button / Ctrl+Shift+3 → tab-audio
-  // capture in the offscreen doc), which pushes these messages back to the tab.
+  // The background pushes a message when the popup toggles this site on/off.
   chrome.runtime.onMessage.addListener((message) => {
     if (!message) {
       return;
     }
-    if (message.type === "autosync-started") {
-      // Anchor the audio window: reading currentTime now marks capture-start in
-      // video time (getUserMedia setup adds ~1s the trigger-time read would miss).
-      if (video) {
-        autosyncAnchorMs = video.currentTime * 1000;
-      }
-      setAutoSyncStatus("Listening to the audio (~12s)…");
-    } else if (message.type === "autosync-run") {
-      setAutoSyncStatus("Matching the transcript to the subtitles…");
-      applyAutoSyncTranscript(message.segments);
-    } else if (message.type === "autosync-error") {
-      setAutoSyncStatus(message.error || "Auto-sync failed.");
-    } else if (message.type === "subtitle-active") {
-      // The popup toggled this site on/off — activate or tear down live.
+    if (message.type === "subtitle-active") {
+      // Activate or tear down live when the site is toggled on/off.
       enabled = Boolean(message.active);
       siteActive = enabled;
       applyEnabledState();
@@ -380,22 +366,12 @@
       ),
     );
 
-    // Auto-sync must be triggered by a real extension invocation (Chrome only lets
-    // it capture tab audio then): the toolbar popup's button or Ctrl+Shift+3. The
-    // result lands here.
-    sourceRow.appendChild(
-      makeEl(
-        "span",
-        { opacity: "0.55", fontSize: "12px", marginTop: "4px" },
-        "Auto-sync: press Ctrl+Shift+3 (or the popup button)",
-      ),
-    );
     autoSyncStatusEl = makeEl("span", { opacity: "0.8", fontSize: "12px" });
     sourceRow.appendChild(autoSyncStatusEl);
 
-    // Manual anchor — the always-reliable fallback. Opens a readable picker; click
-    // the line you hear right now and the offset snaps so that line shows at the
-    // current video time. No ML, always works.
+    // Sync to a line — opens a readable picker; click the line you hear right now
+    // and the offset snaps so that line shows at the current video time. Exact and
+    // always works, so it's the whole sync story for streaming.
     const manualRow = makeEl("div", {
       display: "flex",
       flexDirection: "column",
@@ -462,7 +438,12 @@
       chrome.storage.local.get(SETTINGS_KEY, (result) => {
         const current = (result && result[SETTINGS_KEY]) || {};
         chrome.storage.local.set({
-          [SETTINGS_KEY]: { ...current, offsetMs, fontSizePx, textColor },
+          [SETTINGS_KEY]: {
+            ...current,
+            offsetMs,
+            fontSizePx,
+            textColor,
+          },
         });
       });
     } catch (_) {
@@ -688,6 +669,15 @@
       clearResults();
       const back = makeResultButton("← back to results");
       back.addEventListener("click", doSearch);
+      // Pin it to the top of the scrolling file list so it stays reachable while
+      // scrolling down to pick a file. Opaque background hides rows sliding under it.
+      Object.assign(back.style, {
+        position: "sticky",
+        top: "0",
+        zIndex: "1",
+        background: "rgba(20, 20, 23, 0.98)",
+        borderBottom: "1px solid rgba(255, 255, 255, 0.12)",
+      });
       results.appendChild(back);
       if (!usable.length) {
         setStatus("No usable .srt/.ass files for this title (archives skipped).");
@@ -745,135 +735,13 @@
     }
   }
 
-  // --- Automatic subtitle sync -------------------------------------------------
-  // Normalises a line for fuzzy matching: lower-cased, whitespace removed, and
-  // common Japanese + Latin punctuation stripped so ASR/subtitle punctuation
-  // differences don't hurt the comparison.
+  // Normalises a line for the manual cue-list search: lower-cased, whitespace and
+  // common Japanese + Latin punctuation removed so a loose query still matches.
   function normalizeForMatch(text) {
     return String(text || "")
       .toLowerCase()
       .replace(/\s+/g, "")
       .replace(/[、。，．！？!?「」『』（）()【】\[\]…‥・~〜ー—\-"'`.,:;]/g, "");
-  }
-
-  function bigrams(str) {
-    const grams = [];
-    for (let i = 0; i < str.length - 1; i += 1) {
-      grams.push(str.slice(i, i + 2));
-    }
-    return grams;
-  }
-
-  // Sørensen–Dice coefficient over character bigrams — robust to small ASR errors
-  // and needs no word boundaries, so it works for Japanese. 1 = identical, 0 = no
-  // shared bigrams.
-  function diceSimilarity(a, b) {
-    if (a === b) {
-      return a ? 1 : 0;
-    }
-    if (a.length < 2 || b.length < 2) {
-      return 0;
-    }
-    const counts = new Map();
-    const aGrams = bigrams(a);
-    const bGrams = bigrams(b);
-    for (const g of aGrams) {
-      counts.set(g, (counts.get(g) || 0) + 1);
-    }
-    let matches = 0;
-    for (const g of bGrams) {
-      const c = counts.get(g) || 0;
-      if (c > 0) {
-        counts.set(g, c - 1);
-        matches += 1;
-      }
-    }
-    return (2 * matches) / (aGrams.length + bGrams.length);
-  }
-
-  // Matches transcribed audio lines against the loaded subtitles to find the offset.
-  // Each transcribed segment is placed in video time (anchor + its clip-relative
-  // start); the best-matching cue by text yields an offset estimate (displayed
-  // cue-time = videoTime − offset, so offset = audioTime − cue.startMs). Distinctive
-  // lines appear once, so the correct estimates form a tight cluster that outvotes
-  // any stray mis-match — far more robust than matching speech/silence rhythm.
-  function applyAutoSyncTranscript(segments) {
-    if (!video || !cues.length) {
-      setAutoSyncStatus("Load subtitles and play the video first.");
-      return;
-    }
-    if (!Array.isArray(segments) || !segments.length) {
-      setAutoSyncStatus("No speech was transcribed — try again over dialogue.");
-      return;
-    }
-    if (autosyncAnchorMs == null) {
-      setAutoSyncStatus("Missing the capture anchor — try the sync again.");
-      return;
-    }
-
-    const normCues = cues.map((cue) => normalizeForMatch(cue.text));
-    const MIN_SIMILARITY = 0.5;
-    const estimates = [];
-    for (const segment of segments) {
-      const segText = normalizeForMatch(segment.text);
-      if (segText.length < 2) {
-        continue;
-      }
-      let bestSim = 0;
-      let bestIdx = -1;
-      for (let i = 0; i < normCues.length; i += 1) {
-        const sim = diceSimilarity(segText, normCues[i]);
-        if (sim > bestSim) {
-          bestSim = sim;
-          bestIdx = i;
-        }
-      }
-      if (bestIdx >= 0 && bestSim >= MIN_SIMILARITY) {
-        const absAudioMs = autosyncAnchorMs + (Number(segment.startMs) || 0);
-        estimates.push(absAudioMs - cues[bestIdx].startMs);
-      }
-    }
-
-    if (estimates.length < 2) {
-      setAutoSyncStatus(
-        "Low confidence — try again over dialogue (works best with Japanese subtitles).",
-      );
-      return;
-    }
-
-    // Largest cluster within a tight window, then its median — ignores outliers
-    // from segments that merged lines or mis-matched.
-    const CLUSTER_MS = 400;
-    const sorted = estimates.slice().sort((a, b) => a - b);
-    let best = { count: 0, values: [] };
-    for (let i = 0; i < sorted.length; i += 1) {
-      const group = [];
-      for (
-        let j = i;
-        j < sorted.length && sorted[j] - sorted[i] <= CLUSTER_MS;
-        j += 1
-      ) {
-        group.push(sorted[j]);
-      }
-      if (group.length > best.count) {
-        best = { count: group.length, values: group };
-      }
-    }
-
-    if (best.count < 2) {
-      setAutoSyncStatus(
-        "Low confidence — the lines didn't line up. Try again over dialogue.",
-      );
-      return;
-    }
-
-    const median = best.values[Math.floor(best.values.length / 2)];
-    setOffset(Math.round(median));
-    const seconds = (offsetMs / 1000).toFixed(1);
-    setAutoSyncStatus(
-      `Auto-synced to ${offsetMs >= 0 ? "+" : ""}${seconds}s ` +
-        `(${best.count}/${estimates.length} lines agreed).`,
-    );
   }
 
   function formatClock(ms) {
@@ -890,11 +758,11 @@
       setAutoSyncStatus("Play the video first.");
       return;
     }
-    setOffset(Math.round(video.currentTime * 1000 - cueStartMs));
+    const manualOffset = Math.round(video.currentTime * 1000 - cueStartMs);
     const line = String(label || "").replace(/\s+/g, " ").trim();
-    setAutoSyncStatus(
-      `Synced to: ${line.length > 28 ? `${line.slice(0, 28)}…` : line}`,
-    );
+    const trimmed = line.length > 28 ? `${line.slice(0, 28)}…` : line;
+    setOffset(manualOffset);
+    setAutoSyncStatus(`Synced to: ${trimmed}`);
   }
 
   // (Re)builds the manual cue list inside the dialog, optionally filtered. Rows wrap

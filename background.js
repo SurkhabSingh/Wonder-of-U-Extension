@@ -99,18 +99,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.commands.onCommand.addListener(async (command) => {
-  if (command === "auto-sync-subtitles") {
-    // A command press grants activeTab for the active tab, which tabCapture needs.
-    const [tab] = await chrome.tabs.query({
-      active: true,
-      lastFocusedWindow: true,
-    });
-    if (tab?.id) {
-      startAutoSyncForTab(tab.id);
-    }
-    return;
-  }
-
   try {
     if (command === "start-recording") {
       await startRecording();
@@ -143,7 +131,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     message?.action === "JIMAKU_SEARCH" ||
     message?.action === "JIMAKU_FILES" ||
     message?.action === "JIMAKU_DOWNLOAD" ||
-    message?.action === "RUN_AUTOSYNC" ||
     message?.action === "TOGGLE_SUBTITLE_SITE" ||
     message?.action === "GET_APP_MODE" ||
     message?.action === "SET_APP_MODE" ||
@@ -167,38 +154,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
 
     return true;
-  }
-
-  if (message?.type === "autosync-started") {
-    // Relayed from the offscreen doc to the tab, so it can read video.currentTime
-    // at the true capture-start moment. tabId travels in the message so this works
-    // even if the SW was restarted mid-capture.
-    if (message.tabId != null) {
-      chrome.tabs
-        .sendMessage(message.tabId, { type: "autosync-started" })
-        .catch(() => {});
-    }
-    return false;
-  }
-
-  if (message?.type === "autosync-clip") {
-    // The offscreen doc captured a short clip; transcribe it via the native host
-    // and push the timestamped segments to the tab's overlay for text matching.
-    handleAutoSyncClip(message);
-    return false;
-  }
-
-  if (message?.type === "autosync-complete") {
-    // Now only carries capture-stage errors (success arrives as autosync-clip).
-    if (message.tabId != null && message.error) {
-      chrome.tabs
-        .sendMessage(message.tabId, {
-          type: "autosync-error",
-          error: message.error,
-        })
-        .catch(() => {});
-    }
-    return false;
   }
 
   if (message?.type === "recording-complete") {
@@ -334,13 +289,6 @@ async function handleControlMessage(message, sender) {
 
   if (message.action === "JIMAKU_DOWNLOAD") {
     return jimakuDownload(message);
-  }
-
-  if (message.action === "RUN_AUTOSYNC") {
-    // Triggered from the popup, whose click grants the activeTab that tabCapture
-    // requires. Fire-and-forget: the result is pushed to the tab's overlay.
-    startAutoSyncForTab(message.tabId);
-    return { ok: true };
   }
 
   if (message.action === "TOGGLE_SUBTITLE_SITE") {
@@ -1822,83 +1770,6 @@ async function jimakuDownload(message) {
   }
 }
 // --- end Jimaku subtitle fetch ----------------------------------------------
-
-// Runs an analysis-only tab-audio capture for automatic subtitle sync. The offscreen
-// doc returns a WAV clip which handleAutoSyncClip transcribes; the tab's overlay then
-// matches the transcript to the loaded subtitles. Must be called from an
-// activeTab-granting context (popup click or a command) — tabCapture rejects
-// otherwise. Reuses the recorder's offscreen plumbing.
-async function startAutoSyncForTab(tabId) {
-  if (!tabId) {
-    return;
-  }
-  try {
-    const streamId = await chrome.tabCapture.getMediaStreamId({
-      targetTabId: tabId,
-    });
-    // The offscreen doc acks immediately and later pushes autosync-started /
-    // autosync-clip (both carrying tabId), so the SW needn't stay alive for the
-    // whole capture. ~12s is plenty: text matching only needs a couple of
-    // distinctive lines, and a shorter clip transcribes faster.
-    await sendOffscreenMessage({
-      type: "analyze-audio",
-      streamId,
-      tabId,
-      durationMs: 12000,
-    });
-  } catch (error) {
-    chrome.tabs
-      .sendMessage(tabId, {
-        type: "autosync-error",
-        error: error?.message || "Could not capture the tab audio.",
-      })
-      .catch(() => {});
-  }
-}
-
-// Transcribes an auto-sync clip through the native host and pushes the resulting
-// segments to the tab's overlay. Runs detached from the SW message handler so a
-// long whisper run can't block it; the tabId routes the result back even if the
-// worker was recycled meanwhile.
-async function handleAutoSyncClip(message) {
-  const tabId = message.tabId;
-  if (tabId == null) {
-    return;
-  }
-  try {
-    const transcriptionSettings = await getTranscriptionSettings();
-    if (
-      !transcriptionSettings.whisperCliPath ||
-      !transcriptionSettings.whisperModelPath
-    ) {
-      throw new Error(
-        "Set the Whisper path and model in the desktop app first.",
-      );
-    }
-
-    const response = await requestNativeHostMessage({
-      type: "transcribe-clip",
-      wav: message.wavBase64,
-      // Auto-sync targets Japanese immersion (Jimaku subs + Japanese audio), so
-      // pin the language rather than risk auto-detect on a short clip.
-      language: "ja",
-      whisperCliPath: transcriptionSettings.whisperCliPath,
-      whisperModelPath: transcriptionSettings.whisperModelPath,
-    });
-
-    const segments = Array.isArray(response?.segments) ? response.segments : [];
-    chrome.tabs
-      .sendMessage(tabId, { type: "autosync-run", segments })
-      .catch(() => {});
-  } catch (error) {
-    chrome.tabs
-      .sendMessage(tabId, {
-        type: "autosync-error",
-        error: error?.message || "Could not transcribe the audio.",
-      })
-      .catch(() => {});
-  }
-}
 
 function sleep(ms) {
   return new Promise((resolve) => {
