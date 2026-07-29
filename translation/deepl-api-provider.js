@@ -46,6 +46,13 @@
     return `DeepL returned status ${status}.`;
   }
 
+  // DeepL accepts up to 50 `text` entries per request and returns one translation per entry,
+  // in the same order. That is what makes the per-line mapping real rather than hoped for:
+  // the desktop app pairs transcript line i with translation line i, and splitting a single
+  // translated blob can never guarantee that — a translator re-segments freely, so one line
+  // in can legitimately come back as three sentences.
+  const MAX_TEXTS_PER_REQUEST = 50;
+
   async function capture(sourceText, options = {}) {
     const text = String(sourceText || "").trim();
 
@@ -72,38 +79,67 @@
     }
 
     const sourceLang = String(options.sourceLang || "").trim().toLowerCase();
-    const body = {
-      text: [text],
-      target_lang: toDeepLTarget(options.targetLang),
-    };
 
-    if (sourceLang && sourceLang !== "auto") {
-      body.source_lang = sourceLang.toUpperCase();
+    // Every line is kept, including blank ones, so the result has exactly as many lines as
+    // the transcript did. Blank lines are not SENT — DeepL rejects an empty string — they
+    // are held back by index and restored afterwards.
+    const lines = text.split(/\r?\n/);
+    const sendable = [];
+    lines.forEach((line, index) => {
+      if (line.trim()) {
+        sendable.push({ index, line });
+      }
+    });
+
+    if (sendable.length === 0) {
+      return failure("The transcript was empty.");
     }
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const response = await fetch(endpointForKey(apiKey), {
-        method: "POST",
-        headers: {
-          Authorization: `DeepL-Auth-Key ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+      const translatedLines = lines.slice();
+      for (let start = 0; start < sendable.length; start += MAX_TEXTS_PER_REQUEST) {
+        const batch = sendable.slice(start, start + MAX_TEXTS_PER_REQUEST);
+        const body = {
+          text: batch.map((entry) => entry.line),
+          target_lang: toDeepLTarget(options.targetLang),
+        };
 
-      if (!response.ok) {
-        return failure(describeStatus(response.status));
+        if (sourceLang && sourceLang !== "auto") {
+          body.source_lang = sourceLang.toUpperCase();
+        }
+
+        const response = await fetch(endpointForKey(apiKey), {
+          method: "POST",
+          headers: {
+            Authorization: `DeepL-Auth-Key ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          return failure(describeStatus(response.status));
+        }
+
+        const payload = await response.json().catch(() => null);
+        const translations = payload?.translations || [];
+        // A short reply would shift every later line onto the wrong transcript row, which is
+        // the exact failure this approach exists to prevent — so it is refused, not patched.
+        if (translations.length !== batch.length) {
+          return failure(
+            `DeepL returned ${translations.length} translations for ${batch.length} lines.`,
+          );
+        }
+        batch.forEach((entry, offset) => {
+          translatedLines[entry.index] = String(translations[offset]?.text || "");
+        });
       }
 
-      const payload = await response.json().catch(() => null);
-      const translatedText = (payload?.translations || [])
-        .map((translation) => String(translation?.text || ""))
-        .join("\n")
-        .trim();
+      const translatedText = translatedLines.join("\n").trim();
 
       if (!translatedText) {
         return failure("DeepL returned an empty result.");

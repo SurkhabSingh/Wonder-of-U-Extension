@@ -520,7 +520,16 @@
       );
     }
 
-    // Descends one selector at a time, taking the first match at each step.
+    // Descends one selector at a time, taking the first match at each step — which is what
+    // isolates the translation from the "Try again" and stray "." nodes a flattened selector
+    // would also match.
+    //
+    // At the LAST step it then reads every sibling that matches, not just the one it landed
+    // on. Providers render one node per sentence there, so taking the first truncated a
+    // multi-sentence translation to its opening sentence — the rest of the paragraph was
+    // fetched, rendered, and thrown away. Siblings are filtered from `parent.children`
+    // rather than re-queried with `querySelectorAll`, which would also match nested nodes
+    // and duplicate the text.
     function readWalkText() {
       const steps = selectors.output.walk;
 
@@ -538,7 +547,18 @@
         }
       }
 
-      return cleanTranslatedText(node.textContent || "");
+      const lastStep = steps[steps.length - 1];
+      const siblings = node.parentElement
+        ? Array.from(node.parentElement.children).filter((element) =>
+            element.matches(lastStep),
+          )
+        : [node];
+      const combined = (siblings.length ? siblings : [node])
+        .map((element) => element.textContent || "")
+        .filter((text) => text.trim())
+        .join("\n");
+
+      return cleanTranslatedText(combined);
     }
 
     // `textContent`, never `innerText`: innerText is layout-dependent, and layout
