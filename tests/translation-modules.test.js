@@ -220,6 +220,29 @@ async function run() {
     "the line count is the mapping: it has to survive a round trip",
   );
 
+  // Blank lines are part of the mapping too: dropping one shifts every later line onto the
+  // wrong transcript row, which is the failure the whole line-preserving scheme exists to
+  // avoid. A transcript short enough to skip chunking must come back untouched as well.
+  assert.deepEqual(
+    split("first\n\n\nlast", 4000),
+    ["first\n\n\nlast"],
+    "a short transcript is returned whole, blank lines and all",
+  );
+  const spaced = Array.from(
+    { length: 10 },
+    (_, index) => (index % 3 === 0 ? "" : `Line ${index} of the transcript here.`),
+  ).join("\n");
+  const spacedChunks = split(spaced, limit);
+  assert.equal(
+    spacedChunks.join("\n").split("\n").length,
+    spaced.split("\n").length,
+    "blank lines survive chunking, or every later line pairs with the wrong row",
+  );
+  assert.ok(
+    spacedChunks.every((chunk) => chunk.length <= limit),
+    "the cap still holds once blank lines are in play",
+  );
+
   // A single unbroken run longer than the cap still has to be emitted whole.
   const wrapped = split("x".repeat(500), limit);
   assert.equal(wrapped.join(""), "x".repeat(500));
