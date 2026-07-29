@@ -147,16 +147,11 @@ async function run() {
     'd-textarea [aria-labelledby="translation-target-heading"] p',
     "the aria hook is the primary: it names the region by role, not by a test id",
   );
-  // A DESCENDANT selector, not `> div > p`. DeepL renders one <p> per input line and they
-  // are not direct children of the region, so a strict chain matched only whatever sat at
-  // that exact depth — which read back as the first line of a multi-line translation and
-  // silently dropped the rest.
-  assert.ok(
-    [...deeplSelectors.output.selectors].every(
-      (selector) => !selector.includes(">"),
-    ),
-    "no child combinator: the paragraphs sit at a depth DeepL is free to change",
-  );
+  // A DESCENDANT selector rather than the old `> div > p`, which asserted an intermediate
+  // <div> that is not there — the paragraphs ARE direct children of the region, verified in
+  // the live DOM, so the chain matched nothing at that depth. A descendant selector matches
+  // them either way, which is why it is preferred here; a child combinator on its own would
+  // have been correct too.
   // The element carrying data-testid is a <d-textarea> with no contenteditable
   // attribute — it cannot be typed into. The input selector must reach the inner
   // editable node or the typing fallback silently does nothing.
