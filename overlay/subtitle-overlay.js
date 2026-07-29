@@ -565,18 +565,6 @@
     nameInput.type = "text";
     nameInput.placeholder = "Anime name";
     nameInput.value = titleGuess();
-    const epInput = makeEl("input", {
-      width: "56px",
-      padding: "7px 6px",
-      borderRadius: "8px",
-      border: "1px solid rgba(255,255,255,0.15)",
-      background: "rgba(255,255,255,0.06)",
-      color: "#fff",
-      fontSize: "13px",
-    });
-    epInput.type = "number";
-    epInput.min = "1";
-    epInput.placeholder = "Ep";
     const searchBtn = makeEl(
       "button",
       {
@@ -590,7 +578,7 @@
       },
       "Search",
     );
-    searchRow.append(nameInput, epInput, searchBtn);
+    searchRow.append(nameInput, searchBtn);
 
     const status = makeEl("div", { opacity: "0.75", minHeight: "18px" });
     const results = makeEl("div", {
@@ -641,29 +629,20 @@
     async function loadFiles(entry) {
       clearResults();
       setStatus(`Loading files for “${entry.english_name || entry.name}”…`);
-      const episode = Number(epInput.value) || undefined;
-      let response = await chrome.runtime.sendMessage({
+      // No episode number. Jimaku filters it by parsing digits out of free-form
+      // release filenames, which misses whenever a show numbers absolutely and the
+      // filename numbers per season, or the reverse. Every file for the entry is
+      // listed instead — the desktop app dropped the same filter for the same reason.
+      const response = await chrome.runtime.sendMessage({
         action: "JIMAKU_FILES",
         entryId: entry.id,
-        episode,
       });
       if (!response || !response.ok) {
         setStatus((response && response.error) || "Could not list files.");
         return;
       }
-      let files = response.files || [];
-      if (episode && files.length === 0) {
-        // The episode filter parses numbers out of free-form filenames and often
-        // misses (absolute vs per-season numbering) — fall back to all files.
-        response = await chrome.runtime.sendMessage({
-          action: "JIMAKU_FILES",
-          entryId: entry.id,
-        });
-        files = response && response.ok ? response.files || [] : [];
-        setStatus("No exact episode match — showing all files:");
-      } else {
-        setStatus(`${files.length} file(s) — pick one:`);
-      }
+      const files = response.files || [];
+      setStatus(`${files.length} file(s) — pick one:`);
 
       const usable = files.filter((file) => !/\.(zip|rar|7z)$/i.test(file.name || ""));
       clearResults();

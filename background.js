@@ -1734,13 +1734,10 @@ async function jimakuFiles(message) {
   if (message.entryId == null) {
     return { ok: false, error: "Missing entry id." };
   }
-  const params = new URLSearchParams();
-  if (message.episode) {
-    params.set("episode", String(message.episode));
-  }
-  const suffix = params.toString() ? `?${params.toString()}` : "";
+  // Every file for the entry, unfiltered. `episode` was the only query parameter this
+  // ever built, and filtering on it dropped the right file more often than the wrong one.
   const result = await jimakuApiRequest(
-    `/entries/${encodeURIComponent(message.entryId)}/files${suffix}`,
+    `/entries/${encodeURIComponent(message.entryId)}/files`,
   );
   if (!result.ok) {
     return result;
