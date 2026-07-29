@@ -42,14 +42,19 @@
           '[data-testid="translator-source-input"] [role="textbox"], d-textarea [contenteditable="true"]',
         output: {
           walk: [],
-          // Tried in order, every match joined: DeepL renders one <p> per
-          // sentence. The aria hook is first because it names the region by role
-          // rather than by DeepL's internal test ids; the data-testid selectors
-          // stay as fallbacks, and the last one catches a short phrase that lands
-          // as a bare text node with no <p> wrapper.
+          // Tried in order, every match joined with a newline. DeepL renders one <p>
+          // per INPUT LINE, so reading them all yields a translation with the same
+          // number of lines as the transcript — the 1:1 pairing the app needs, with
+          // no API key involved.
+          //
+          // A descendant selector, not `> div > p`: the paragraphs are not direct
+          // children of that region, so the strict chain matched only whatever sat at
+          // that exact depth and dropped the rest of the translation.
           selectors: [
-            '[aria-labelledby="translation-target-heading"] > div > p',
+            'd-textarea [aria-labelledby="translation-target-heading"] p',
             '[data-testid="translator-target-input"] div[contenteditable="true"] p',
+            // Last resort: a short phrase can land as a bare text node with no <p>
+            // wrapper at all, which the two above would miss entirely.
             '[data-testid="translator-target-input"] div[contenteditable="true"]',
           ],
         },

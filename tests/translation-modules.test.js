@@ -144,8 +144,18 @@ async function run() {
     context.DeepLTranslateProvider.config.pageConfig.selectors;
   assert.equal(
     [...deeplSelectors.output.selectors][0],
-    '[aria-labelledby="translation-target-heading"] > div > p',
+    'd-textarea [aria-labelledby="translation-target-heading"] p',
     "the aria hook is the primary: it names the region by role, not by a test id",
+  );
+  // A DESCENDANT selector, not `> div > p`. DeepL renders one <p> per input line and they
+  // are not direct children of the region, so a strict chain matched only whatever sat at
+  // that exact depth — which read back as the first line of a multi-line translation and
+  // silently dropped the rest.
+  assert.ok(
+    [...deeplSelectors.output.selectors].every(
+      (selector) => !selector.includes(">"),
+    ),
+    "no child combinator: the paragraphs sit at a depth DeepL is free to change",
   );
   // The element carrying data-testid is a <d-textarea> with no contenteditable
   // attribute — it cannot be typed into. The input selector must reach the inner
@@ -191,6 +201,28 @@ async function run() {
     chunks.join(" ").replace(/\s+/g, " "),
     sentences,
     "chunking must preserve the whole transcript",
+  );
+
+  // A multi-line transcript must come back with the SAME NUMBER OF LINES, because that is
+  // what the per-line pairing rests on: the provider renders one paragraph per input line
+  // and the app pairs transcript line i with translation line i. Chunking used to split on
+  // sentence endings and rejoin the pieces with a space, which flattened the transcript
+  // into one paragraph before it ever reached the translator — and the mapping with it.
+  const transcriptLines = Array.from(
+    { length: 12 },
+    (_, index) => `Line number ${index} of the transcript.`,
+  );
+  const lineChunks = split(transcriptLines.join("\n"), limit);
+  assert.ok(lineChunks.length > 1, "the fixture must actually be split");
+  assert.equal(
+    lineChunks.join("\n"),
+    transcriptLines.join("\n"),
+    "chunking must preserve every line break, not just the words",
+  );
+  assert.equal(
+    lineChunks.join("\n").split("\n").length,
+    transcriptLines.length,
+    "the line count is the mapping: it has to survive a round trip",
   );
 
   // A single unbroken run longer than the cap still has to be emitted whole.

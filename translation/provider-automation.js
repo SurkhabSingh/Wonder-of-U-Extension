@@ -384,26 +384,54 @@
       return [text];
     }
 
-    const pieces = text
-      .split(/(?<=[.!?。！？\n])\s+/)
-      .flatMap((piece) => (piece.length <= limit ? [piece] : hardWrap(piece, limit)));
+    // Lines first, sentences only within a line that is too long on its own.
+    //
+    // The transcript's line structure is the basis of the per-line mapping: the provider
+    // renders one paragraph per input line, and the app pairs transcript line i with
+    // translation line i. This used to split on sentence endings across the whole text and
+    // rejoin with a SPACE, which flattened a multi-line transcript into one paragraph before
+    // it ever reached the translator. Short ones escaped only by returning early, above.
+    //
+    // A single line longer than the cap still has to be broken somewhere, and a sentence
+    // boundary is the least damaging place — `hardWrap` cuts mid-word. Those pieces carry a
+    // space rather than a newline so the line is not silently turned into several.
+    const pieces = [];
+    text.split(/\r?\n/).forEach((line, lineIndex) => {
+      const parts =
+        line.length <= limit
+          ? [line]
+          : line
+              .split(/(?<=[.!?。！？])\s+/)
+              .flatMap((part) =>
+                part.length <= limit ? [part] : hardWrap(part, limit),
+              );
+
+      parts.forEach((part, partIndex) => {
+        pieces.push({
+          text: part,
+          separator: partIndex > 0 ? " " : lineIndex > 0 ? "\n" : "",
+        });
+      });
+    });
 
     const chunks = [];
     let current = "";
 
     for (const piece of pieces) {
       if (!current) {
-        current = piece;
+        current = piece.text;
         continue;
       }
 
-      if (`${current} ${piece}`.length <= limit) {
-        current = `${current} ${piece}`;
+      const joined = `${current}${piece.separator || " "}${piece.text}`;
+
+      if (joined.length <= limit) {
+        current = joined;
         continue;
       }
 
       chunks.push(current);
-      current = piece;
+      current = piece.text;
     }
 
     if (current) {
