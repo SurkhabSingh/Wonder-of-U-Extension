@@ -104,8 +104,20 @@
         display: none !important;
       }
 
-      body {
+      /* The width belongs on the root element, not on body. Chrome sizes an action
+         popup from the root: with only body constrained, the root keeps its 800px
+         measurement viewport and the layout sits in a 380px column with 420px of bare
+         canvas beside it. `max-width` and auto inline margins stop that from coming
+         back anywhere this document is hosted wider than a popup — a tab, a panel —
+         where the column centres instead of hugging the left edge. */
+      html {
         width: 380px;
+        max-width: 100%;
+        margin-inline: auto;
+      }
+
+      body {
+        width: 100%;
         margin: 0;
         padding: 16px;
         background: var(--canvas);
